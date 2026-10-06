@@ -1,13 +1,18 @@
-//! The README's example program must stay valid.
-use std::path::Path;
+//! The README's example programs must stay valid.
 
 #[test]
-fn readme_example_parses_resolves_and_renders_canonically() {
+fn readme_examples_parse_resolve_and_render_canonically() {
     let readme = include_str!("../README.md");
-    let start = readme.find("```enzyme\n").expect("README has an enzyme example") + "```enzyme\n".len();
-    let source = &readme[start..start + readme[start..].find("```").unwrap()];
-    let program = enzyme_spec::parse(source).unwrap();
-    let rendered = enzyme_spec::render_program(&program);
-    assert_eq!(enzyme_spec::parse(&rendered).unwrap(), program);
-    enzyme_spec::resolve(vec![program], Path::new("/home/demo")).unwrap();
+    let environment =
+        enzyme_spec::Environment::new("/home/demo").with_enzyme_home("/home/demo/.enzyme");
+    let mut examples = 0;
+    for block in readme.split("```enzyme\n").skip(1) {
+        let source = &block[..block.find("```").unwrap()];
+        let program = enzyme_spec::parse(source).unwrap();
+        let rendered = enzyme_spec::render_program(&program);
+        assert_eq!(enzyme_spec::parse(&rendered).unwrap(), program);
+        enzyme_spec::resolve_in(vec![program], &environment).unwrap();
+        examples += 1;
+    }
+    assert!(examples >= 2, "README has enzyme examples");
 }

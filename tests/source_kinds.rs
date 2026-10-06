@@ -468,12 +468,53 @@ workspace "practice" {
         "SELECT 'sqlite:' || 'mail' || '/' || id AS ref, id, t, w FROM rows WHERE feed = 'mail'"
     );
     assert_eq!(mail.document_ref.as_deref(), Some("ref"));
-    // Substituted as a literal like any other value.
+    // In a query it is the engine's escaped source key, as a literal.
     assert!(
         sqlite(&resolved, "practice", "it's")
             .query
-            .ends_with("feed = 'it''s'")
+            .ends_with("feed = 'it%27s'")
     );
+}
+
+#[test]
+fn source_in_a_query_is_the_escaped_key_document_refs_need() {
+    let kind = r#"
+source kind ledger {
+  database "{home}/{source}.db"
+  query """SELECT 'sqlite:' || {source} || '/' || id AS ref, id, t, w FROM rows"""
+  id "id"
+  document ref "ref"
+  when "t" unit s
+  what "w"
+}
+"#;
+    let workspace = r#"
+workspace "practice" {
+  source ledger "My Mail" {}
+  source ledger "Café" {}
+  learn questions from source "My Mail"
+}
+"#;
+    let resolved = resolve_text(&[kind, workspace], &environment()).unwrap();
+    let mail = sqlite(&resolved, "practice", "My Mail");
+    // The path keeps the declared name; the ref prefix is escaped.
+    assert_eq!(mail.db, "/home/demo/.margins/My Mail.db");
+    assert_eq!(
+        mail.query,
+        "SELECT 'sqlite:' || 'My%20Mail' || '/' || id AS ref, id, t, w FROM rows"
+    );
+    assert!(
+        sqlite(&resolved, "practice", "Café")
+            .query
+            .contains("'sqlite:' || 'Caf%C3%A9' || '/'")
+    );
+    // The same key the reading lowers to.
+    let vault = resolved
+        .vaults
+        .iter()
+        .find(|v| v.workspace.as_deref() == Some("practice"))
+        .unwrap();
+    assert_eq!(vault.readings[0].entity, "collection:sqlite:My%20Mail");
 }
 
 #[test]

@@ -102,9 +102,11 @@ describes, keeping the declared name:
   an `accepts` field cannot be substituted. `{source}` lets a template build
   readable document refs without knowing its declaration:
   `'sqlite:' || {source} || '/' || id AS ref` with `document ref "ref"`.
-  (The Enzyme engine requires refs inside `sqlite:<name>/`, with bytes other
-  than letters, digits, `-`, `_` and `.` percent-escaped in `<name>`; source
-  names made of those characters need no escaping.) A source name is a name,
+  The Enzyme engine requires refs inside `sqlite:<key>/`, where `<key>` is
+  the name with bytes other than ASCII letters, digits, `-`, `_` and `.`
+  percent-escaped, so in `query` `{source}` is that key: `"My Mail"` becomes
+  `'My%20Mail'` and `"Café"` becomes `'Caf%C3%A9'` (names made only of those
+  characters are unchanged). In `database` it stays the declared name. A source name is a name,
   not a path: `.`, `..`, `/`, `\` and NUL are rejected. `source` is reserved,
   so a kind can no longer declare a field named `source`.
 - In `query`, a placeholder stands for a whole SQL value: text becomes a

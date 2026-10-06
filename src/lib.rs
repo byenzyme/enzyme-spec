@@ -1995,7 +1995,10 @@ pub fn entity_selector(kind: &str, name: &str) -> String {
     }
 }
 
-fn sqlite_source_key(name: &str) -> String {
+/// The engine's key for a SQLite source name: bytes other than ASCII letters,
+/// digits, `-`, `_` and `.` percent-escaped. Document refs must start with
+/// `sqlite:<key>/`.
+pub(crate) fn sqlite_source_key(name: &str) -> String {
     let mut escaped = String::new();
     for byte in name.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {

@@ -196,7 +196,15 @@ impl SourceKind {
         .context("database")?;
         let query = fill_query(&self.template.query, &mut |name| {
             let declared = is_supplied(name) || self.needs.iter().any(|need| need == name);
-            declared.then(|| sql_value(&value(name)?))
+            // In SQL, `{source}` builds document refs, which the engine
+            // requires to start with `sqlite:<escaped name>/`.
+            declared.then(|| {
+                if name == SOURCE {
+                    Ok(sql_value(&HostValue::Text(crate::sqlite_source_key(source)))?)
+                } else {
+                    sql_value(&value(name)?)
+                }
+            })
         })
         .map_err(|error| match error {
             FillError::Unknown(name) => self.undeclared_placeholder(&name),

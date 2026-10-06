@@ -22,7 +22,7 @@
 //! or removing it is out of scope. Writes replace the file by rename: its
 //! permissions are kept, a symlink is written through, but a hard link to the
 //! old file keeps the old contents.
-use crate::{Environment, Program, Reading, Source, Workspace, parse, resolve_with_in};
+use crate::{Automatic, Environment, Program, Reading, Source, Workspace, parse, resolve_with_in};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -651,6 +651,37 @@ fn workspace_changes(before: &Workspace, after: &Workspace, out: &mut Vec<Change
             ws,
             "readings",
             "Reorder readings",
+        ));
+    }
+    if before.automatic != after.automatic {
+        let limit = |automatic: &Automatic| {
+            automatic
+                .up_to
+                .map_or_else(String::new, |n| format!(" up to {n}"))
+        };
+        let (action, summary) = match (&before.automatic, &after.automatic) {
+            (None, Some(a)) => (
+                Action::Added,
+                format!("Learn questions automatically{}", limit(a)),
+            ),
+            (Some(_), None) => (
+                Action::Removed,
+                "Stop learning questions automatically".to_string(),
+            ),
+            (_, a) => (
+                Action::Changed,
+                format!(
+                    "Learn questions automatically{}",
+                    a.as_ref().map(limit).unwrap_or_default()
+                ),
+            ),
+        };
+        out.push(change(
+            Statement::Reading,
+            action,
+            ws,
+            "automatically",
+            summary,
         ));
     }
 

@@ -22,8 +22,9 @@ pub struct SourceKind {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepts: Vec<String>,
     /// The SQLite source every declaration expands to. `db` and `query` may
-    /// hold `{workspace}`, `{home}`, and `{<needs field>}` placeholders; `name`
-    /// is the kind name and is replaced by the declaration's name.
+    /// hold `{workspace}`, `{source}`, `{home}`, and `{<needs field>}`
+    /// placeholders; `name` is the kind name and is replaced by the
+    /// declaration's name.
     pub template: SqliteSource,
 }
 
@@ -32,7 +33,13 @@ pub(crate) const NATIVE_KINDS: &[&str] = &["markdown", "sqlite", "arena", "kind"
 
 /// Placeholders every template may use besides its `needs` fields.
 const WORKSPACE: &str = "workspace";
+const SOURCE: &str = "source";
 const HOME: &str = "home";
+
+/// Whether `name` is a placeholder every template may use.
+fn is_supplied(name: &str) -> bool {
+    name == WORKSPACE || name == SOURCE || name == HOME
+}
 
 impl SourceKind {
     /// Check the definition on its own: names, field lists, and that every
@@ -59,7 +66,7 @@ impl SourceKind {
                 "source kind {kind} field {field:?} must be one or more words"
             );
             ensure!(
-                field != WORKSPACE && field != HOME,
+                !is_supplied(field),
                 "source kind {kind} cannot declare field {field:?}; {{{field}}} is always supplied"
             );
             ensure!(
@@ -71,9 +78,7 @@ impl SourceKind {
                 "source kind {kind} declares field {field:?} more than once"
             );
         }
-        let declared = |name: &str| {
-            name == WORKSPACE || name == HOME || self.needs.iter().any(|need| need == name)
-        };
+        let declared = |name: &str| is_supplied(name) || self.needs.iter().any(|need| need == name);
         let undeclared = |name: &str| self.undeclared_placeholder(name);
         fill_path(&self.template.db, &mut |name| {
             if declared(name) {
@@ -98,11 +103,11 @@ impl SourceKind {
         let kind = &self.name;
         if self.accepts.iter().any(|field| field == name) {
             anyhow::anyhow!(
-                "source kind {kind} uses placeholder {{{name}}}, but {name:?} is an accepts field; only needs fields, {{workspace}}, and {{home}} can be substituted"
+                "source kind {kind} uses placeholder {{{name}}}, but {name:?} is an accepts field; only needs fields, {{workspace}}, {{source}}, and {{home}} can be substituted"
             )
         } else {
             anyhow::anyhow!(
-                "source kind {kind} uses placeholder {{{name}}} for an undeclared field; add `needs {name}` or use {{workspace}} or {{home}}"
+                "source kind {kind} uses placeholder {{{name}}} for an undeclared field; add `needs {name}` or use {{workspace}}, {{source}}, or {{home}}"
             )
         }
     }
@@ -116,6 +121,14 @@ impl SourceKind {
     ) -> Result<SqliteSource> {
         let kind = &self.name;
         let source = &host.name;
+        // `{source}` may fill a database path, so a name must not be one.
+        ensure!(
+            !source.trim().is_empty()
+                && source != "."
+                && source != ".."
+                && !source.contains(['/', '\\', '\0']),
+            "source {kind} {source:?}: a source name must be a name, not a path: no /, \\, NUL, or . / .."
+        );
         let mut database = None;
         for field in &host.fields {
             let key = field.key.as_str();
@@ -146,6 +159,7 @@ impl SourceKind {
         let value = |name: &str| -> Result<HostValue> {
             Ok(match name {
                 WORKSPACE => HostValue::Text(workspace.to_string()),
+                SOURCE => HostValue::Text(source.to_string()),
                 HOME => HostValue::Text(
                     environment
                         .enzyme_home
@@ -167,8 +181,7 @@ impl SourceKind {
         // The template's path and a declaration's override fill the same way.
         let path = database.as_deref().unwrap_or(&self.template.db);
         let db = fill_path(path, &mut |name| {
-            let declared =
-                name == WORKSPACE || name == HOME || self.needs.iter().any(|need| need == name);
+            let declared = is_supplied(name) || self.needs.iter().any(|need| need == name);
             if !declared {
                 return Err(self.undeclared_placeholder(name));
             }
@@ -182,8 +195,7 @@ impl SourceKind {
         })
         .context("database")?;
         let query = fill_query(&self.template.query, &mut |name| {
-            let declared =
-                name == WORKSPACE || name == HOME || self.needs.iter().any(|need| need == name);
+            let declared = is_supplied(name) || self.needs.iter().any(|need| need == name);
             declared.then(|| sql_value(&value(name)?))
         })
         .map_err(|error| match error {

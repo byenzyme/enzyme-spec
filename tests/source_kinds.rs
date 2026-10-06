@@ -404,6 +404,10 @@ fn definition_errors_are_reported_at_parse_time() {
             "cannot declare field \"home\"",
         ),
         (
+            kind("accepts source\n database \"/d\" query \"SELECT 1\""),
+            "cannot declare field \"source\"",
+        ),
+        (
             kind("accepts database\n database \"/d\" query \"SELECT 1\""),
             "cannot declare field \"database\"",
         ),
@@ -435,5 +439,55 @@ fn definition_errors_are_reported_at_parse_time() {
     for (text, expected) in cases {
         let message = parse_error(text.clone());
         assert!(message.contains(expected), "{text}\n=> {message}");
+    }
+}
+
+#[test]
+fn source_is_the_declaration_name() {
+    let kind = r#"
+source kind ledger {
+  database "{home}/workspaces/{workspace}/{source}.db"
+  query """SELECT 'sqlite:' || {source} || '/' || id AS ref, id, t, w FROM rows WHERE feed = {source}"""
+  id "id"
+  document ref "ref"
+  when "t" unit s
+  what "w"
+}
+"#;
+    let workspace = r#"
+workspace "practice" {
+  source ledger "mail" {}
+  source ledger "it's" {}
+}
+"#;
+    let resolved = resolve_text(&[kind, workspace], &environment()).unwrap();
+    let mail = sqlite(&resolved, "practice", "mail");
+    assert_eq!(mail.db, "/home/demo/.margins/workspaces/practice/mail.db");
+    assert_eq!(
+        mail.query,
+        "SELECT 'sqlite:' || 'mail' || '/' || id AS ref, id, t, w FROM rows WHERE feed = 'mail'"
+    );
+    assert_eq!(mail.document_ref.as_deref(), Some("ref"));
+    // Substituted as a literal like any other value.
+    assert!(
+        sqlite(&resolved, "practice", "it's")
+            .query
+            .ends_with("feed = 'it''s'")
+    );
+}
+
+#[test]
+fn source_names_are_not_paths() {
+    let kind = r#"
+source kind ledger {
+  database "{home}/{source}/x.db"
+  query "SELECT id, t, w FROM rows"
+  id "id" when "t" unit s what "w"
+}
+"#;
+    for name in ["..", "."] {
+        let workspace = format!("workspace \"w\" {{\n  source ledger \"{name}\" {{}}\n}}\n");
+        let message = error(&[kind, &workspace], &environment());
+        assert!(message.contains("must be a name, not a path"), "{message}");
     }
 }

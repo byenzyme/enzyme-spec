@@ -63,9 +63,17 @@ workspace "practice" {
 `resolve` expands each declaration to the native SQLite source the template
 describes, keeping the declared name:
 
-- `{workspace}` is the workspace name, `{home}` the Enzyme home supplied by the
-  host, and `{field}` the value of a `needs` field. No other placeholder is
-  allowed, and an `accepts` field cannot be substituted.
+- `{workspace}` is the workspace name, `{source}` the declaration's name
+  (`"mail"` above), `{home}` the Enzyme home supplied by the host, and
+  `{field}` the value of a `needs` field. No other placeholder is allowed, and
+  an `accepts` field cannot be substituted. `{source}` lets a template build
+  readable document refs without knowing its declaration:
+  `'sqlite:' || {source} || '/' || id AS ref` with `document ref "ref"`.
+  (The Enzyme engine requires refs inside `sqlite:<name>/`, with bytes other
+  than letters, digits, `-`, `_` and `.` percent-escaped in `<name>`; source
+  names made of those characters need no escaping.) A source name is a name,
+  not a path: `.`, `..`, `/`, `\` and NUL are rejected. `source` is reserved,
+  so a kind can no longer declare a field named `source`.
 - In `query`, a placeholder stands for a whole SQL value: text becomes a
   single-quoted literal with quotes doubled, integers stay numbers, `true`/`false`
   become `1`/`0`, and a list becomes a parenthesized list of literals, so write
@@ -94,6 +102,35 @@ let resolved = enzyme_spec::resolve_in(programs, &environment)?;
 
 `resolve(programs, user_home)` is `resolve_in` with no Enzyme home and no
 built-in kinds.
+
+## One directory, many workspaces
+
+`resolve` and `load_directory` are strict: any invalid declaration fails the
+whole namespace. A host that keeps several workspaces in one config directory
+uses `resolve_namespace_in` / `load_namespace_in` instead, which resolve each
+workspace and vault on its own and return a `Namespace`: the program of
+everything that resolved, plus `problems`, each scoped to the declaration it
+breaks (`Scope::Workspace`, `Scope::Vault`, a `Scope::File` that does not
+parse, or a `Scope::Profile`/`Scope::SourceKind` defined differently in two
+files). `Namespace::workspace_problems(name)` is what makes one workspace
+unusable: its own problems, and unparsable files when it resolved nowhere.
+
+- Workspaces are addressed by name, so two workspaces may read the same
+  Markdown folder. Only two `vault "<path>"` declarations of one path
+  conflict. `Program::keyed_vaults` gives each resolved vault its runtime key:
+  `workspace:<name>`, a `vault`'s path, and the path of a lone-Markdown
+  workspace while nothing else claims it. `Namespace::lone_markdown_paths`
+  lists every lone-Markdown workspace's folder as declared, including ones
+  that failed to resolve, so a host can tell a folder is shared even while one
+  of its workspaces is invalid.
+- A profile or source kind defined differently in two files fails exactly
+  the workspaces and vaults that use it.
+- What every declaration inherits is still one namespace: repeated
+  `settings` fields, global learning, or global retrieval are errors for all.
+
+`resolve_with_in(others, candidate, environment)` checks one file against the
+rest: it fails on the candidate's own problems and on problems it causes in
+other files, but tolerates problems the other files already had.
 
 ## Embedding hosts
 
@@ -144,7 +181,12 @@ receipts live there too unless `with_state_dir` moves them. `load_directory`
 ignores that directory. Writes replace the file by rename, keeping its
 permissions and writing through a symlink; a hard link keeps the old text.
 Moving a workspace between files, renaming, or removing it is out of scope.
-Hosts that lower their own source kinds pass a validator with
+Planning validates the desired program with `resolve_with`, so another
+config file that is invalid (or does not parse) never blocks editing this
+one; a desired program that breaks another file is refused. A validator
+receives the other programs followed by the candidate, last. Hosts with
+built-in kinds or an Enzyme home pass `plan::resolver_in(environment)`, and
+hosts that lower their own source kinds pass any validator, with
 `ConfigStore::with_validator`.
 
 ## License

@@ -60,7 +60,7 @@ workspace "meetings" {
 
 The engine treats the declared readings as automatic selection's first picks:
 each entity a reading names counts toward the engine's automatic limit (20 in
-Enzyme; `settings { selection limit N }` changes it), and the documents of
+Enzyme; `settings { selection … }` values have no effect on it), and the documents of
 everything the readings select count as already covered, so automatic picks
 favor what the readings miss. `up to N` caps the automatic picks further; it
 never raises the limit. A reading always takes precedence for its entity (the

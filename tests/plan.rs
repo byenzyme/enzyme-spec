@@ -568,3 +568,22 @@ fn another_invalid_file_does_not_block_planning_a_workspace() {
     let plan = store.plan("shared", &shared).unwrap();
     store.apply(&plan).unwrap();
 }
+
+#[test]
+fn plan_summarizes_automatic_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "practice.enzyme", BASE);
+    let store = open(tmp.path());
+    let with = BASE.replace(
+        "about relationships\n",
+        "about relationships\n  learn questions automatically\n",
+    );
+    let plan = store.plan("practice", &with).unwrap();
+    assert_eq!(summaries(&plan), ["Learn questions automatically"]);
+    write(tmp.path(), "practice.enzyme", &with);
+    let capped = with.replace("automatically\n", "automatically up to 4\n");
+    let plan = store.plan("practice", &capped).unwrap();
+    assert_eq!(summaries(&plan), ["Learn questions automatically up to 4"]);
+    let plan = store.plan("practice", BASE).unwrap();
+    assert_eq!(summaries(&plan), ["Stop learning questions automatically"]);
+}

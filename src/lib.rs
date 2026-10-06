@@ -62,6 +62,16 @@ impl Selection {
         }
     }
 }
+/// `learn questions automatically [up to N]`: the engine's automatic
+/// (coverage) selection adds entities to the declared readings instead of
+/// being switched off by them. Automatic picks are never written back.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Automatic {
+    /// At most this many automatically selected entities (`up to N`), within
+    /// the engine's own automatic limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_to: Option<usize>,
+}
 /// Reference time for every time-dependent reading behavior in a vault.
 /// A date is the end of that UTC day; absence keeps the wall clock.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -215,6 +225,9 @@ pub struct Vault {
     pub path: String,
     pub learning: Learning,
     pub readings: Vec<Reading>,
+    /// Automatic selection alongside the readings (`learn questions automatically`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic: Option<Automatic>,
     pub exclusions: Vec<String>,
     pub excluded_tags: Vec<String>,
     pub excluded_links: Vec<String>,
@@ -364,6 +377,8 @@ pub struct Workspace {
     pub sources: Vec<Source>,
     pub learning: Learning,
     pub readings: Vec<Reading>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic: Option<Automatic>,
     pub format: Option<String>,
     #[serde(default)]
     pub targets: Vec<String>,
@@ -396,6 +411,7 @@ impl Workspace {
             path,
             learning: self.learning.clone(),
             readings: self.readings.clone(),
+            automatic: self.automatic.clone(),
             format: self.format.clone(),
             targets: self.targets.clone(),
             exclusions: self.exclusions.clone(),
@@ -465,6 +481,7 @@ impl Workspace {
         self.note_policies = vault.note_policies;
         self.learning = vault.learning;
         self.readings = vault.readings;
+        self.automatic = vault.automatic;
         self.format = vault.format;
         self.targets = vault.targets;
         self.exclusions = vault.exclusions;
@@ -1304,7 +1321,30 @@ impl Parser {
         in_workspace: bool,
     ) -> Result<()> {
         {
-            if self.at("learn") {
+            if self.at("learn")
+                && self
+                    .tokens
+                    .get(self.pos + 2)
+                    .is_some_and(|token| !token.string && token.value == "automatically")
+            {
+                self.need("learn")?;
+                self.need("questions")?;
+                self.need("automatically")?;
+                if self.at("select") {
+                    // Bare `select` here would silently become the vault's
+                    // child-selection default.
+                    return self.err(
+                        "automatic selection ranks by coverage; limit it with learn questions automatically up to N",
+                    );
+                }
+                let up_to = if self.eat("up") {
+                    self.need("to")?;
+                    Some(self.number(1, 10_000)?)
+                } else {
+                    None
+                };
+                self.set(&mut v.automatic, Automatic { up_to })?;
+            } else if self.at("learn") {
                 let readings = self.reading()?;
                 ensure!(
                     in_workspace
@@ -3094,6 +3134,13 @@ fn render_body(v: &Vault) -> String {
             s.push_str(" {\n");
             s.push_str(&render_learning(&local, "      "));
             s.push_str("    }");
+        }
+        s.push('\n');
+    }
+    if let Some(automatic) = &v.automatic {
+        s.push_str("  learn questions automatically");
+        if let Some(n) = automatic.up_to {
+            s.push_str(&format!(" up to {n}"));
         }
         s.push('\n');
     }

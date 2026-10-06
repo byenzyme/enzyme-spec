@@ -1180,3 +1180,79 @@ fn sqlite_reading_uses_the_runtime_escaped_source_identity() {
         "collection:sqlite:caf%C3%A9/thread/Design"
     );
 }
+
+#[test]
+fn automatic_selection_adds_to_readings_and_roundtrips() {
+    let source = r#"
+workspace "practice" {
+  source markdown "notes" { path "/srv/notes" }
+  learn questions automatically up to 5
+  learn questions from folder "Meetings"
+  learn questions from folder "People" including linked pages
+  leave out folders { "Templates" }
+}
+vault "/srv/other" {
+  learn questions automatically
+}"#;
+    let parsed = parse(source).unwrap();
+    assert_eq!(
+        parsed.workspaces[0].automatic,
+        Some(Automatic { up_to: Some(5) })
+    );
+    assert_eq!(parsed.vaults[0].automatic, Some(Automatic { up_to: None }));
+    assert!(parsed.vaults[0].readings.is_empty());
+    let rendered = render_program(&parsed);
+    // The statement renders after the readings it adds to.
+    assert!(
+        rendered.contains(
+            "  learn questions from folder \"People\"\n    including linked pages\n  learn questions automatically up to 5\n"
+        ),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("vault \"/srv/other\" {\n  learn questions automatically\n}"),
+        "{rendered}"
+    );
+    assert_eq!(parse(&rendered).unwrap(), parsed);
+
+    let resolved = resolve(vec![parsed], Path::new("/home/demo")).unwrap();
+    let workspace = resolved
+        .vaults
+        .iter()
+        .find(|v| v.workspace.as_deref() == Some("practice"))
+        .unwrap();
+    assert_eq!(workspace.automatic, Some(Automatic { up_to: Some(5) }));
+    assert_eq!(workspace.readings.len(), 2);
+    // The effective vault renders the statement too.
+    assert!(render_vault(workspace).contains("learn questions automatically up to 5"));
+
+    // Without the statement, readings stay the complete set.
+    let plain = compile(r#"vault "/srv/x" { learn questions from folder "a" }"#);
+    assert_eq!(plain.vaults[0].automatic, None);
+}
+
+#[test]
+fn automatic_selection_rejects_duplicates_and_bad_limits() {
+    for (source, message) in [
+        (
+            r#"vault "/x" { learn questions automatically learn questions automatically }"#,
+            "repeated",
+        ),
+        (
+            r#"vault "/x" { learn questions automatically up to 0 }"#,
+            "expected integer",
+        ),
+        (
+            r#"vault "/x" { learn questions automatically up to "5" }"#,
+            "expected integer",
+        ),
+        (r#"vault "/x" { learn questions automatically up 5 }"#, "to"),
+        (
+            r#"vault "/x" { learn questions automatically select 5 by frequency }"#,
+            "up to N",
+        ),
+    ] {
+        let error = format!("{:#}", parse(source).unwrap_err());
+        assert!(error.contains(message), "{source}: {error}");
+    }
+}

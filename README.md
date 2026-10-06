@@ -41,6 +41,35 @@ let resolved = enzyme_spec::resolve(vec![program], &user_home)?;
 let canonical = enzyme_spec::render_program(&resolved);
 ```
 
+## Readings and automatic selection
+
+Without readings, the engine chooses what to learn questions about on its own
+(automatic selection). Once a vault or workspace declares readings, they are
+the complete set. `learn questions automatically` keeps automatic selection
+running alongside them:
+
+```enzyme
+workspace "meetings" {
+  source markdown "notes" { path "~/notes" }
+  learn questions from folder "Meetings"
+  learn questions from folder "People" including linked pages
+  learn questions automatically up to 10
+  leave out folders { "Templates" }
+}
+```
+
+The engine treats the declared readings as automatic selection's first picks:
+each entity a reading names counts toward the engine's automatic limit (20 in
+Enzyme), and its documents count as already covered, so automatic picks favor
+what the readings miss. `up to N` caps the automatic picks further; it never
+raises the limit. A reading always takes precedence for its entity (the entity
+is learned once, with the reading's settings), leave-outs apply to automatic
+picks, and hosts never write automatic picks back into the program. The
+statement renders after the readings, and without readings it simply allows
+`up to N` to cap ordinary automatic selection. `learn questions automatically
+select …` is an error: automatic selection ranks by coverage, not by frequency
+or recency.
+
 ## Source kinds
 
 A `source kind` turns a source into SQL once, so declarations stay short:

@@ -1730,6 +1730,10 @@ impl Parser {
     fn workspace(&mut self) -> Result<Workspace> {
         self.need("workspace")?;
         let name = self.string()?;
+        if let Err(problem) = check_workspace_name(&name) {
+            self.pos -= 1;
+            return self.err(&problem.to_string());
+        }
         self.need("{")?;
         let mut workspace = Workspace {
             name,
@@ -1797,6 +1801,16 @@ impl Parser {
         }
         Ok(workspace)
     }
+}
+
+/// A workspace name names one directory under the Enzyme home and fills
+/// `{workspace}` in source kind paths, so it must not be a path.
+pub fn check_workspace_name(name: &str) -> Result<()> {
+    ensure!(
+        !name.trim().is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0']),
+        "workspace name {name:?} must be a name, not a path: no /, \\, NUL, or . / .."
+    );
+    Ok(())
 }
 
 /// Create-note folders stay inside their Markdown source.
@@ -2176,6 +2190,7 @@ pub fn resolve_in(programs: Vec<Program>, environment: &Environment) -> Result<P
     for p in programs {
         let mut scopes = p.vaults;
         for mut workspace in p.workspaces {
+            check_workspace_name(&workspace.name)?;
             for source in &mut workspace.sources {
                 if let Source::Host(host) = source {
                     let kind = all

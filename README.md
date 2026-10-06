@@ -68,12 +68,16 @@ describes, keeping the declared name:
   allowed, and an `accepts` field cannot be substituted.
 - In `query`, a placeholder stands for a whole SQL value: text becomes a
   single-quoted literal with quotes doubled, integers stay numbers, `true`/`false`
-  become `1`/`0`, and a list becomes comma-separated literals for `IN (…)`.
+  become `1`/`0`, and a list becomes a parenthesized list of literals, so write
+  `IN {tags}` (an empty list is an error).
   Write placeholders bare (`= {account}`, not `= '{account}'`); one inside a
   quoted string or identifier is an error, and comments are never substituted.
   Values containing NUL are rejected.
 - In `database`, placeholders are path text, then `~` expands. Any declaration
-  may give `database "…"` to replace the template's path.
+  may give `database "…"` to replace the template's path; the override fills
+  the same placeholders, so `database` cannot be a `needs` or `accepts` field.
+  Workspace names, which fill `{workspace}`, must not contain `/`, `\`, or NUL,
+  or be `.`/`..`.
 - A declaration missing a `needs` field, or giving a field that is neither
   needed nor accepted, is an error that lists the kind's fields.
 

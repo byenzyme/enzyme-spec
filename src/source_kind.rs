@@ -63,6 +63,10 @@ impl SourceKind {
                 "source kind {kind} cannot declare field {field:?}; {{{field}}} is always supplied"
             );
             ensure!(
+                field != "database",
+                "source kind {kind} cannot declare field \"database\"; every declaration may already override database"
+            );
+            ensure!(
                 seen.insert(field.as_str()),
                 "source kind {kind} declares field {field:?} more than once"
             );
@@ -118,6 +122,8 @@ impl SourceKind {
             if self.needs.iter().chain(&self.accepts).any(|f| f == key) {
                 continue;
             }
+            // validate() keeps `database` out of needs/accepts, so it is
+            // always the override.
             if key == "database" {
                 let HostValue::Text(path) = &field.value else {
                     bail!("source {kind} {source:?}: database must be quoted text");
@@ -158,16 +164,23 @@ impl SourceKind {
                     .with_context(|| format!("source kind {kind} has no field {name:?}"))?,
             })
         };
-        let db = match database {
-            Some(path) => path,
-            None => fill_path(&self.template.db, &mut |name| match value(name)? {
+        // The template's path and a declaration's override fill the same way.
+        let path = database.as_deref().unwrap_or(&self.template.db);
+        let db = fill_path(path, &mut |name| {
+            let declared =
+                name == WORKSPACE || name == HOME || self.needs.iter().any(|need| need == name);
+            if !declared {
+                return Err(self.undeclared_placeholder(name));
+            }
+            match value(name)? {
                 HostValue::Text(text) => Ok(text),
                 HostValue::Integer(n) => Ok(n.to_string()),
                 _ => bail!(
                     "source {kind} {source:?}: field {name:?} must be text or an integer to appear in the database path"
                 ),
-            })?,
-        };
+            }
+        })
+        .context("database")?;
         let query = fill_query(&self.template.query, &mut |name| {
             let declared =
                 name == WORKSPACE || name == HOME || self.needs.iter().any(|need| need == name);
@@ -391,17 +404,24 @@ fn fill_query(
 
 /// A field value as a SQLite literal. Text is single-quoted with embedded
 /// quotes doubled (SQLite gives backslashes no meaning inside literals); a
-/// list becomes comma-separated literals for use inside `IN (…)`.
+/// list becomes a parenthesized row value for `IN {list}`. An empty list is an
+/// error rather than a query that silently matches nothing.
 fn sql_value(value: &HostValue) -> Result<String> {
     Ok(match value {
         HostValue::Text(text) => sql_text(text)?,
         HostValue::Integer(n) => n.to_string(),
         HostValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-        HostValue::List(items) => items
-            .iter()
-            .map(|item| sql_text(item))
-            .collect::<Result<Vec<_>>>()?
-            .join(", "),
+        HostValue::List(items) => {
+            ensure!(
+                !items.is_empty(),
+                "an empty list has no SQL value; give at least one item"
+            );
+            let items = items
+                .iter()
+                .map(|item| sql_text(item))
+                .collect::<Result<Vec<_>>>()?;
+            format!("({})", items.join(", "))
+        }
     })
 }
 

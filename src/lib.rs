@@ -6,6 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod source_kind;
+pub use source_kind::{Environment, SourceKind, sql_text};
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub seek: String,
@@ -498,6 +501,9 @@ pub struct Program {
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
     pub retrieval: Option<Vec<String>>,
+    /// `source kind` definitions, keyed by kind name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_kinds: BTreeMap<String, SourceKind>,
 }
 impl Program {
     /// Let the embedding host replace its own source kinds with native sources
@@ -1346,10 +1352,11 @@ impl Parser {
                         "in source applies only inside a workspace"
                     );
                     ensure!(
-                        !v.note_policies.iter().any(|existing| existing.folder
-                            == policy.folder
-                            && existing.source.as_deref().map(str::to_lowercase)
-                                == policy.source.as_deref().map(str::to_lowercase)),
+                        !v.note_policies
+                            .iter()
+                            .any(|existing| existing.folder == policy.folder
+                                && existing.source.as_deref().map(str::to_lowercase)
+                                    == policy.source.as_deref().map(str::to_lowercase)),
                         "duplicate create note policy for folder {:?}",
                         policy.folder
                     );
@@ -1408,7 +1415,10 @@ impl Parser {
                 guidance.push(self.string()?);
             }
             self.need("}")?;
-            ensure!(!guidance.is_empty(), "create note guidance must not be empty");
+            ensure!(
+                !guidance.is_empty(),
+                "create note guidance must not be empty"
+            );
         }
         Ok(NotePolicy {
             folder,
@@ -1502,6 +1512,78 @@ impl Parser {
         self.need("sqlite")?;
         let name = self.string()?;
         self.need("{")?;
+        Ok(Source::Sqlite(self.sqlite_body(
+            name,
+            "SQLite source",
+            &mut |_| Ok(false),
+        )?))
+    }
+
+    /// `source kind <name> { needs …  accepts …  <SQLite source fields> }`.
+    fn source_kind(&mut self) -> Result<SourceKind> {
+        self.need("source")?;
+        self.need("kind")?;
+        let name = self.word()?;
+        if source_kind::NATIVE_KINDS.contains(&name.as_str()) {
+            return self.err(&format!("source kind {name} is reserved by the language"));
+        }
+        self.need("{")?;
+        let (mut needs, mut accepts) = (None, None);
+        let template = self.sqlite_body(
+            name.clone(),
+            &format!("source kind {name}"),
+            &mut |p: &mut Parser| {
+                if p.eat("needs") {
+                    let fields = p.field_names()?;
+                    p.set(&mut needs, fields)?;
+                } else if p.eat("accepts") {
+                    let fields = p.field_names()?;
+                    p.set(&mut accepts, fields)?;
+                } else {
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
+        let kind = SourceKind {
+            name,
+            needs: needs.unwrap_or_default(),
+            accepts: accepts.unwrap_or_default(),
+            template,
+        };
+        kind.validate()?;
+        Ok(kind)
+    }
+
+    /// Comma-separated field names; each name is one or more words on one line.
+    fn field_names(&mut self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        loop {
+            let mut words = vec![self.word()?];
+            while !self.t().string
+                && self.t().line == self.tokens[self.pos - 1].line
+                && self
+                    .t()
+                    .value
+                    .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+            {
+                words.push(self.word()?);
+            }
+            names.push(words.join(" "));
+            if !self.eat(",") {
+                return Ok(names);
+            }
+        }
+    }
+
+    /// The fields of a SQLite source after its opening brace. `extra` may
+    /// consume statements the caller adds (returning `true`).
+    fn sqlite_body(
+        &mut self,
+        name: String,
+        what_label: &str,
+        extra: &mut dyn FnMut(&mut Parser) -> Result<bool>,
+    ) -> Result<SqliteSource> {
         let (mut db, mut query, mut id, mut who, mut when, mut what, mut where_columns) =
             (None, None, None, None, None, None, None);
         let (mut document_ref, mut weight, mut filter) = (None, None, None);
@@ -1567,35 +1649,35 @@ impl Parser {
                     "unknown SQLite source filter {value:?}"
                 );
                 self.set(&mut filter, value)?;
-            } else {
-                return self.err(
-                    "expected database, query, id, document ref, who, when, what, where, weight, or filter in SQLite source",
-                );
+            } else if !extra(self)? {
+                return self.err(&format!(
+                    "expected database, query, id, document ref, who, when, what, where, weight, or filter in {what_label}",
+                ));
             }
         }
         self.need("}")?;
         let required = |value: Option<String>, field: &str| -> Result<String> {
             value
                 .filter(|v| !v.trim().is_empty())
-                .with_context(|| format!("SQLite source {name:?} needs {field}"))
+                .with_context(|| format!("{what_label} {name:?} needs {field}"))
         };
-        Ok(Source::Sqlite(SqliteSource {
+        Ok(SqliteSource {
             name: name.clone(),
             db: required(db, "database")?,
             query: required(query, "query")?,
-            id: id.context("SQLite source needs id")?,
+            id: id.with_context(|| format!("{what_label} {name:?} needs id"))?,
             document_ref,
             who: who.unwrap_or(SqliteWho::Columns {
                 columns: Vec::new(),
             }),
             when: required(when, "when")?,
-            what: what.context("SQLite source needs what")?,
+            what: what.with_context(|| format!("{what_label} {name:?} needs what"))?,
             where_columns: where_columns.unwrap_or_default(),
             weight,
             timestamp_unit: timestamp_unit.context("SQLite source needs when unit")?,
             timestamp_epoch,
             filter,
-        }))
+        })
     }
 
     /// `source <kind> "name" { <words…> <value> … }` for any kind the language
@@ -1665,6 +1747,11 @@ impl Parser {
                     Some(token) if token.value == "arena" => self.arena_source()?,
                     Some(token) if token.value == "sqlite" => self.sqlite_source()?,
                     Some(token) if token.value == "markdown" => self.markdown_source()?,
+                    Some(token) if token.value == "kind" => {
+                        return self.err(
+                            "source kind definitions belong at the top level, outside any workspace",
+                        );
+                    }
                     _ => self.host_source()?,
                 };
                 let source_name = source.name();
@@ -1687,7 +1774,9 @@ impl Parser {
         for policy in &workspace.note_policies {
             match &policy.source {
                 Some(source) => ensure!(
-                    markdown.iter().any(|name| name.eq_ignore_ascii_case(source)),
+                    markdown
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(source)),
                     "create note in source {source:?}: workspace {:?} declares no Markdown source with that name",
                     workspace.name
                 ),
@@ -1773,9 +1862,23 @@ pub fn parse(source: &str) -> Result<Program> {
         } else if p.at("when") {
             let x = p.retrieval()?;
             p.set(&mut out.retrieval, x)?;
+        } else if p.at("source") {
+            if p.tokens
+                .get(p.pos + 1)
+                .is_none_or(|t| t.string || t.value != "kind")
+            {
+                return p.err("sources belong inside a workspace; use source kind <name> { … } to define a kind");
+            }
+            let kind = p.source_kind()?;
+            let name = kind.name.clone();
+            ensure!(
+                out.source_kinds.insert(name.clone(), kind).is_none(),
+                "duplicate source kind {name}"
+            );
         } else {
-            return p
-                .err("expected profile, let, settings, learning, workspace, vault, or when asked");
+            return p.err(
+                "expected profile, let, settings, learning, source kind, workspace, vault, or when asked",
+            );
         }
     }
     Ok(out)
@@ -1851,23 +1954,23 @@ fn folder_is_excluded(folder: &str, exclusions: &[String]) -> bool {
 fn lower_workspace(workspace: Workspace) -> Result<Vault> {
     if let Some(host) = workspace.host_sources().next() {
         bail!(
-            "source {} {:?} in workspace {:?} is a host source; the host must lower it before resolution",
+            "source {} {:?} in workspace {:?} has no source kind {}: define `source kind {} {{ … }}` in the configs directory, or the host must lower it before resolution",
             host.kind,
             host.name,
-            workspace.name
+            workspace.name,
+            host.kind,
+            host.kind
         );
     }
     let mut vault = workspace.unresolved_vault();
     let markdown: Vec<&MarkdownSource> = workspace.markdown_sources().collect();
     for policy in &mut vault.note_policies {
-        let source = workspace
-            .note_policy_source(policy)
-            .with_context(|| {
-                format!(
-                    "create note in folder {:?} names no Markdown source of workspace {:?}",
-                    policy.folder, workspace.name
-                )
-            })?;
+        let source = workspace.note_policy_source(policy).with_context(|| {
+            format!(
+                "create note in folder {:?} names no Markdown source of workspace {:?}",
+                policy.folder, workspace.name
+            )
+        })?;
         policy.root = Some(source.path.clone());
     }
     if workspace.markdown_path().is_some() {
@@ -2026,6 +2129,14 @@ fn lower_workspace(workspace: Workspace) -> Result<Vault> {
 }
 /// Resolve files as one namespace. Identical reusable profiles may be shared; conflicting declarations are errors.
 pub fn resolve(programs: Vec<Program>, user_home: &Path) -> Result<Program> {
+    resolve_in(programs, &Environment::new(user_home))
+}
+
+/// [`resolve`] with what the host knows: the Enzyme home for `{home}` and
+/// built-in source kinds. Declarations of a defined source kind expand here
+/// to native SQLite sources, so every caller sees the same sources.
+pub fn resolve_in(programs: Vec<Program>, environment: &Environment) -> Result<Program> {
+    let user_home = environment.user_home.as_path();
     let mut all = Program::default();
     let mut defaults = Learning::default();
     let mut global_retrieval = None;
@@ -2038,6 +2149,16 @@ pub fn resolve(programs: Vec<Program>, user_home: &Path) -> Result<Program> {
                 );
             } else {
                 all.profiles.insert(name.clone(), profile.clone());
+            }
+        }
+        for (name, kind) in &p.source_kinds {
+            if let Some(existing) = all.source_kinds.get(name) {
+                ensure!(
+                    existing == kind,
+                    "conflicting source kind {name} across config files"
+                );
+            } else {
+                all.source_kinds.insert(name.clone(), kind.clone());
             }
         }
         merge_learning(&mut defaults, &p.learning)?;
@@ -2056,6 +2177,23 @@ pub fn resolve(programs: Vec<Program>, user_home: &Path) -> Result<Program> {
         let mut scopes = p.vaults;
         for mut workspace in p.workspaces {
             for source in &mut workspace.sources {
+                if let Source::Host(host) = source {
+                    let kind = all
+                        .source_kinds
+                        .get(&host.kind)
+                        .or_else(|| environment.builtin_kinds.get(&host.kind));
+                    if let Some(kind) = kind {
+                        let expanded = kind
+                            .expand(host, &workspace.name, environment)
+                            .with_context(|| {
+                                format!(
+                                    "source {} {:?} in workspace {:?}",
+                                    host.kind, host.name, workspace.name
+                                )
+                            })?;
+                        *source = Source::Sqlite(expanded);
+                    }
+                }
                 match source {
                     Source::Sqlite(source) => {
                         source.db = expand(&source.db, user_home);
@@ -2186,6 +2324,11 @@ fn merge_settings(a: &mut Settings, b: &Settings) -> Result<()> {
 }
 /// Non-recursive .enzyme files form the reusable profile namespace. No includes or code execution.
 pub fn load_directory(directory: &Path, user_home: &Path) -> Result<Option<Program>> {
+    load_directory_in(directory, &Environment::new(user_home))
+}
+
+/// [`load_directory`] resolved with [`resolve_in`].
+pub fn load_directory_in(directory: &Path, environment: &Environment) -> Result<Option<Program>> {
     if !directory.exists() {
         return Ok(None);
     }
@@ -2204,7 +2347,7 @@ pub fn load_directory(directory: &Path, user_home: &Path) -> Result<Option<Progr
                 .with_context(|| format!("invalid reading config {}", p.display()))
         })
         .collect::<Result<Vec<_>>>()?;
-    resolve(programs, user_home).map(Some)
+    resolve_in(programs, environment).map(Some)
 }
 
 pub fn instructions(vault: &Vault) -> String {
@@ -2400,7 +2543,10 @@ pub fn config_value(p: &Program) -> serde_json::Value {
             ("excluded_folders", &workspace.exclusions),
             ("excluded_tags", &workspace.excluded_tags),
             ("excluded_links", &workspace.excluded_links),
-            ("frontmatter_link_fields", &workspace.frontmatter_link_fields),
+            (
+                "frontmatter_link_fields",
+                &workspace.frontmatter_link_fields,
+            ),
         ] {
             if !list.is_empty() {
                 item[key] = json!(list);
@@ -2542,8 +2688,7 @@ fn render_body(v: &Vault) -> String {
             let selector = if k == "thread" {
                 let (source, thread) = n.split_once('/').expect("parsed thread has source");
                 format!("{} in source {}", quote(thread), quote(source))
-            } else if k == "channel" && !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit())
-            {
+            } else if k == "channel" && !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit()) {
                 n.to_string()
             } else {
                 quote(n)
@@ -2732,57 +2877,77 @@ fn render_source(source: &Source) -> String {
         }
         Source::Sqlite(source) => {
             output.push_str(&format!("  source sqlite {} {{\n", quote(&source.name)));
-            output.push_str(&format!("    database {}\n", quote(&source.db)));
-            if source.query.contains('\n') && !source.query.contains("\"\"\"") {
-                output.push_str("    query \"\"\"");
-                output.push_str(&source.query);
-                output.push_str("\"\"\"\n");
-            } else {
-                output.push_str(&format!("    query {}\n", quote(&source.query)));
-            }
-            output.push_str(&format!("    id {}\n", render_columns(&source.id)));
-            if let Some(column) = &source.document_ref {
-                output.push_str(&format!("    document ref {}\n", quote(column)));
-            }
-            match &source.who {
-                SqliteWho::Columns { columns } if !columns.is_empty() => {
-                    output.push_str(&format!("    who {}\n", render_columns(columns)))
-                }
-                SqliteWho::JsonArray { column } => {
-                    output.push_str(&format!("    who json_array {}\n", quote(column)))
-                }
-                SqliteWho::Delimited { column, delimiter } => output.push_str(&format!(
-                    "    who delimited {} by {}\n",
-                    quote(column),
-                    quote(delimiter)
-                )),
-                _ => {}
-            }
-            output.push_str(&format!(
-                "    when {} unit {}",
-                quote(&source.when),
-                source.timestamp_unit
-            ));
-            if let Some(epoch) = &source.timestamp_epoch {
-                output.push_str(&format!(" epoch {}", quote(epoch)));
-            }
-            output.push('\n');
-            output.push_str(&format!("    what {}\n", render_columns(&source.what)));
-            if !source.where_columns.is_empty() {
-                output.push_str(&format!(
-                    "    where {}\n",
-                    render_columns(&source.where_columns)
-                ));
-            }
-            if let Some(column) = &source.weight {
-                output.push_str(&format!("    weight {}\n", quote(column)));
-            }
-            if let Some(filter) = &source.filter {
-                output.push_str(&format!("    filter {}\n", quote(filter)));
-            }
+            output.push_str(&render_sqlite_fields(source, "    "));
             output.push_str("  }\n");
         }
     }
+    output
+}
+
+fn render_sqlite_fields(source: &SqliteSource, indent: &str) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("{indent}database {}\n", quote(&source.db)));
+    if source.query.contains('\n') && !source.query.contains("\"\"\"") {
+        output.push_str(&format!("{indent}query \"\"\""));
+        output.push_str(&source.query);
+        output.push_str("\"\"\"\n");
+    } else {
+        output.push_str(&format!("{indent}query {}\n", quote(&source.query)));
+    }
+    output.push_str(&format!("{indent}id {}\n", render_columns(&source.id)));
+    if let Some(column) = &source.document_ref {
+        output.push_str(&format!("{indent}document ref {}\n", quote(column)));
+    }
+    match &source.who {
+        SqliteWho::Columns { columns } if !columns.is_empty() => {
+            output.push_str(&format!("{indent}who {}\n", render_columns(columns)))
+        }
+        SqliteWho::JsonArray { column } => {
+            output.push_str(&format!("{indent}who json_array {}\n", quote(column)))
+        }
+        SqliteWho::Delimited { column, delimiter } => output.push_str(&format!(
+            "{indent}who delimited {} by {}\n",
+            quote(column),
+            quote(delimiter)
+        )),
+        _ => {}
+    }
+    output.push_str(&format!(
+        "{indent}when {} unit {}",
+        quote(&source.when),
+        source.timestamp_unit
+    ));
+    if let Some(epoch) = &source.timestamp_epoch {
+        output.push_str(&format!(" epoch {}", quote(epoch)));
+    }
+    output.push('\n');
+    output.push_str(&format!("{indent}what {}\n", render_columns(&source.what)));
+    if !source.where_columns.is_empty() {
+        output.push_str(&format!(
+            "{indent}where {}\n",
+            render_columns(&source.where_columns)
+        ));
+    }
+    if let Some(column) = &source.weight {
+        output.push_str(&format!("{indent}weight {}\n", quote(column)));
+    }
+    if let Some(filter) = &source.filter {
+        output.push_str(&format!("{indent}filter {}\n", quote(filter)));
+    }
+    output
+}
+
+/// `source kind <name> { … }` at the top level of a program.
+pub fn render_source_kind(kind: &SourceKind) -> String {
+    let mut output = format!("source kind {} {{\n", kind.name);
+    if !kind.needs.is_empty() {
+        output.push_str(&format!("  needs {}\n", kind.needs.join(", ")));
+    }
+    if !kind.accepts.is_empty() {
+        output.push_str(&format!("  accepts {}\n", kind.accepts.join(", ")));
+    }
+    output.push_str(&render_sqlite_fields(&kind.template, "  "));
+    output.push_str("}\n\n");
     output
 }
 
@@ -2794,7 +2959,11 @@ fn render_host_value(value: &HostValue) -> String {
         HostValue::List(items) => {
             let inline = format!(
                 "{{ {} }}",
-                items.iter().map(|item| quote(item)).collect::<Vec<_>>().join(" ")
+                items
+                    .iter()
+                    .map(|item| quote(item))
+                    .collect::<Vec<_>>()
+                    .join(" ")
             );
             if inline.len() <= LINE_BUDGET - 8 {
                 inline
@@ -2893,6 +3062,9 @@ pub fn render_program(p: &Program) -> String {
     }
     for (name, profile) in &p.profiles {
         s.push_str(&render_profile(name, profile));
+    }
+    for kind in p.source_kinds.values() {
+        s.push_str(&render_source_kind(kind));
     }
     if p.learning != Learning::default() {
         s.push_str("learning {\n");

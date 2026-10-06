@@ -1256,3 +1256,27 @@ fn automatic_selection_rejects_duplicates_and_bad_limits() {
         assert!(error.contains(message), "{source}: {error}");
     }
 }
+
+#[test]
+fn automatic_up_to_roundtrips_through_render() {
+    for (source, up_to) in [
+        (r#"vault "/x" { learn questions automatically up to 7 }"#, Some(7)),
+        (r#"vault "/x" { learn questions automatically }"#, None),
+        (
+            r#"workspace "w" { source markdown "n" { path "/n" } learn questions from folder "a" learn questions automatically up to 1 }"#,
+            Some(1),
+        ),
+    ] {
+        let parsed = parse(source).unwrap();
+        let automatic = parsed
+            .vaults
+            .first()
+            .map(|v| v.automatic.clone())
+            .unwrap_or_else(|| parsed.workspaces[0].automatic.clone());
+        assert_eq!(automatic, Some(Automatic { up_to }), "{source}");
+        let rendered = render_program(&parsed);
+        let reparsed = parse(&rendered).unwrap();
+        assert_eq!(reparsed, parsed, "{rendered}");
+        assert_eq!(render_program(&reparsed), rendered);
+    }
+}

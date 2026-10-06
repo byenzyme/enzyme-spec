@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod plan;
 mod source_kind;
 pub use source_kind::{Environment, SourceKind, sql_text};
 
@@ -2187,10 +2188,16 @@ pub fn resolve_in(programs: Vec<Program>, environment: &Environment) -> Result<P
     }
     defaults = defaults.over(&Learning::default());
     let mut paths = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
     for p in programs {
         let mut scopes = p.vaults;
         for mut workspace in p.workspaces {
             check_workspace_name(&workspace.name)?;
+            ensure!(
+                names.insert(workspace.name.clone()),
+                "duplicate workspace {:?}",
+                workspace.name
+            );
             for source in &mut workspace.sources {
                 if let Source::Host(host) = source {
                     let kind = all

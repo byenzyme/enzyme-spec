@@ -385,7 +385,9 @@ fn hosts_can_validate_with_their_own_lowering() {
     let tmp = tempfile::tempdir().unwrap();
     let hosted = "workspace \"practice\" {\n  source google-mail \"mail\" { account \"me@example.com\" }\n}\n";
     let plain = open(tmp.path());
-    assert!(format!("{:#}", plain.plan("practice", hosted).unwrap_err()).contains("has no source kind"));
+    assert!(
+        format!("{:#}", plain.plan("practice", hosted).unwrap_err()).contains("has no source kind")
+    );
     let lowering = open(tmp.path()).with_validator(Box::new(|mut programs| {
         for program in &mut programs {
             program.lower_host_sources(|_, host| {
@@ -483,10 +485,7 @@ fn an_unrecoverable_journal_blocks_only_its_own_file_until_discarded() {
     let (completed, removed) = store.discard_unrecoverable().unwrap();
     assert!(completed.is_empty());
     assert_eq!(removed, [journal.clone()]);
-    assert_eq!(
-        read(tmp.path(), "practice.enzyme"),
-        hand
-    );
+    assert_eq!(read(tmp.path(), "practice.enzyme"), hand);
     store.plan("practice", BASE).unwrap();
 }
 
@@ -547,4 +546,25 @@ fn leftover_temporaries_are_removed_under_the_lock() {
     std::fs::write(&leftover, "partial").unwrap();
     open(tmp.path()).plan("practice", DESIRED).unwrap();
     assert!(!leftover.exists());
+}
+
+#[test]
+fn another_invalid_file_does_not_block_planning_a_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "practice.enzyme", BASE);
+    // One file does not parse; another parses but does not resolve.
+    write(dir.path(), "typo.enzyme", "workspace \"typo\" {");
+    write(
+        dir.path(),
+        "other.enzyme",
+        "workspace \"other\" {\n  source markdown \"notes\" { path \"relative\" }\n}\n",
+    );
+    let store = open(dir.path());
+    let plan = store.plan("practice", DESIRED).unwrap();
+    store.apply(&plan).unwrap();
+    assert_eq!(read(dir.path(), "practice.enzyme"), DESIRED);
+    // A second workspace reading the same notes folder is fine.
+    let shared = BASE.replace("practice", "shared");
+    let plan = store.plan("shared", &shared).unwrap();
+    store.apply(&plan).unwrap();
 }

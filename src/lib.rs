@@ -226,6 +226,10 @@ pub struct Vault {
     pub retrieval: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub note_policies: Vec<NotePolicy>,
+    /// The workspace this vault was lowered from. Filled by [`resolve`];
+    /// `None` for a `vault "<path>"` declaration and in a parsed program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -507,6 +511,35 @@ pub struct Program {
     pub source_kinds: BTreeMap<String, SourceKind>,
 }
 impl Program {
+    /// Each resolved vault with the key a runtime addresses it by. A `vault`
+    /// declaration is keyed by its path, and a workspace by
+    /// `workspace:<name>`. A workspace whose only source is one Markdown
+    /// folder is also keyed by that path (its legacy identity) while no
+    /// `vault` and no other such workspace claims the path; otherwise the
+    /// path alone does not say which one is meant.
+    pub fn keyed_vaults(&self) -> Vec<(String, &Vault)> {
+        let lone = |v: &Vault| v.workspace.is_some() && !v.path.starts_with("workspace:");
+        let mut claims = BTreeMap::<&str, usize>::new();
+        for v in &self.vaults {
+            if v.workspace.is_none() || lone(v) {
+                *claims.entry(v.path.as_str()).or_default() += 1;
+            }
+        }
+        let mut keyed = Vec::new();
+        for v in &self.vaults {
+            match &v.workspace {
+                None => keyed.push((v.path.clone(), v)),
+                Some(name) => {
+                    keyed.push((format!("workspace:{name}"), v));
+                    if lone(v) && claims[v.path.as_str()] == 1 {
+                        keyed.push((v.path.clone(), v));
+                    }
+                }
+            }
+        }
+        keyed
+    }
+
     /// Let the embedding host replace its own source kinds with native sources
     /// before [`resolve`]. `lower` receives the workspace name and each host
     /// source in declaration order; `Ok(Some(source))` replaces it and
@@ -2150,28 +2183,150 @@ pub fn resolve(programs: Vec<Program>, user_home: &Path) -> Result<Program> {
 /// [`resolve`] with what the host knows: the Enzyme home for `{home}` and
 /// built-in source kinds. Declarations of a defined source kind expand here
 /// to native SQLite sources, so every caller sees the same sources.
+///
+/// Strict: any [`Problem`] of [`resolve_namespace_in`] is an error.
 pub fn resolve_in(programs: Vec<Program>, environment: &Environment) -> Result<Program> {
-    let user_home = environment.user_home.as_path();
+    resolve_namespace_in(programs, environment)?.into_program()
+}
+
+/// The declaration a [`Problem`] belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Scope {
+    /// A config file that does not parse; nothing it declares is known.
+    File(PathBuf),
+    /// `workspace "<name>" { … }`, by name.
+    Workspace(String),
+    /// `vault "<path>" { … }`, by resolved path.
+    Vault(String),
+    /// A profile defined differently in several files.
+    Profile(String),
+    /// A source kind defined differently in several files.
+    SourceKind(String),
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Scope::File(path) => write!(f, "config file {}", path.display()),
+            Scope::Workspace(name) => write!(f, "workspace {name:?}"),
+            Scope::Vault(path) => write!(f, "vault {path:?}"),
+            Scope::Profile(name) => write!(f, "profile {name}"),
+            Scope::SourceKind(name) => write!(f, "source kind {name}"),
+        }
+    }
+}
+
+/// One declaration that does not resolve. It is left out of the resolved
+/// program; everything else still resolves.
+#[derive(Debug)]
+pub struct Problem {
+    pub scope: Scope,
+    pub error: anyhow::Error,
+}
+
+impl Problem {
+    /// The full error chain on one line, e.g. for comparing or logging.
+    pub fn message(&self) -> String {
+        format!("{:#}", self.error)
+    }
+}
+
+/// A namespace resolved one declaration at a time: what resolved, and the
+/// declarations that did not.
+///
+/// What every declaration inherits is still all-or-nothing: duplicate
+/// `settings`, global learning, or global retrieval fail
+/// [`resolve_namespace_in`] itself. A profile or source kind defined
+/// differently in two files is a [`Scope::Profile`]/[`Scope::SourceKind`]
+/// problem, and it fails exactly the workspaces and vaults that use it.
+#[derive(Debug, Default)]
+pub struct Namespace {
+    pub program: Program,
+    pub problems: Vec<Problem>,
+}
+
+impl Namespace {
+    /// The resolved program, or the first problem as an error.
+    pub fn into_program(self) -> Result<Program> {
+        match self.problems.into_iter().next() {
+            Some(problem) => Err(problem.error),
+            None => Ok(self.program),
+        }
+    }
+
+    /// Problems that make workspace `name` unusable: its own, and — when it
+    /// resolved nowhere — every config file that does not parse, since it may
+    /// be declared in one of them.
+    pub fn workspace_problems(&self, name: &str) -> Vec<&Problem> {
+        let resolved = self.program.workspaces.iter().any(|w| w.name == name);
+        self.problems
+            .iter()
+            .filter(|problem| match &problem.scope {
+                Scope::Workspace(scope) => scope == name,
+                Scope::File(_) => !resolved,
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Problems that make the vault at resolved path `path` unusable, by the
+    /// same rule as [`Self::workspace_problems`].
+    pub fn vault_problems(&self, path: &str) -> Vec<&Problem> {
+        let resolved = self
+            .program
+            .vaults
+            .iter()
+            .any(|v| v.workspace.is_none() && v.path == path);
+        self.problems
+            .iter()
+            .filter(|problem| match &problem.scope {
+                Scope::Vault(scope) => scope == path,
+                Scope::File(_) => !resolved,
+                _ => false,
+            })
+            .collect()
+    }
+}
+
+/// Resolve each workspace and vault on its own, so one invalid or conflicting
+/// declaration does not stop the others from resolving.
+///
+/// Two workspaces may read the same Markdown folder: workspaces are addressed
+/// by name, so only two `vault` declarations of one path conflict. See
+/// [`Namespace`] for what is still an error for the whole namespace.
+pub fn resolve_namespace_in(
+    programs: Vec<Program>,
+    environment: &Environment,
+) -> Result<Namespace> {
+    let mut problems = Vec::new();
     let mut all = Program::default();
     let mut defaults = Learning::default();
     let mut global_retrieval = None;
+    let mut conflicting_profiles = std::collections::BTreeSet::new();
+    let mut conflicting_kinds = std::collections::BTreeSet::new();
     for p in &programs {
         for (name, profile) in &p.profiles {
             if let Some(existing) = all.profiles.get(name) {
-                ensure!(
-                    existing == profile,
-                    "conflicting profile {name} across config files"
-                );
+                if existing != profile && conflicting_profiles.insert(name.clone()) {
+                    problems.push(Problem {
+                        scope: Scope::Profile(name.clone()),
+                        error: anyhow::anyhow!("conflicting profile {name} across config files"),
+                    });
+                }
             } else {
                 all.profiles.insert(name.clone(), profile.clone());
             }
         }
         for (name, kind) in &p.source_kinds {
             if let Some(existing) = all.source_kinds.get(name) {
-                ensure!(
-                    existing == kind,
-                    "conflicting source kind {name} across config files"
-                );
+                if existing != kind && conflicting_kinds.insert(name.clone()) {
+                    problems.push(Problem {
+                        scope: Scope::SourceKind(name.clone()),
+                        error: anyhow::anyhow!(
+                            "conflicting source kind {name} across config files"
+                        ),
+                    });
+                }
             } else {
                 all.source_kinds.insert(name.clone(), kind.clone());
             }
@@ -2186,123 +2341,270 @@ pub fn resolve_in(programs: Vec<Program>, environment: &Environment) -> Result<P
             global_retrieval = Some(r.clone());
         }
     }
+    for name in &conflicting_profiles {
+        all.profiles.remove(name);
+    }
+    for name in &conflicting_kinds {
+        all.source_kinds.remove(name);
+    }
     defaults = defaults.over(&Learning::default());
-    let mut paths = std::collections::BTreeSet::new();
-    let mut names = std::collections::BTreeSet::new();
+    let context = Resolution {
+        environment,
+        all: &all,
+        defaults: &defaults,
+        global_retrieval: &global_retrieval,
+        conflicting_profiles: &conflicting_profiles,
+        conflicting_kinds: &conflicting_kinds,
+    };
+
+    let mut declared = BTreeMap::<String, usize>::new();
+    for workspace in programs.iter().flat_map(|p| &p.workspaces) {
+        *declared.entry(workspace.name.clone()).or_default() += 1;
+    }
+    let mut duplicate_reported = std::collections::BTreeSet::new();
+    let mut workspaces = Vec::new();
+    let mut vaults: Vec<Vault> = Vec::new();
     for p in programs {
-        let mut scopes = p.vaults;
-        for mut workspace in p.workspaces {
-            check_workspace_name(&workspace.name)?;
-            ensure!(
-                names.insert(workspace.name.clone()),
-                "duplicate workspace {:?}",
-                workspace.name
-            );
-            for source in &mut workspace.sources {
-                if let Source::Host(host) = source {
-                    let kind = all
-                        .source_kinds
-                        .get(&host.kind)
-                        .or_else(|| environment.builtin_kinds.get(&host.kind));
-                    if let Some(kind) = kind {
-                        let expanded = kind
-                            .expand(host, &workspace.name, environment)
-                            .with_context(|| {
-                                format!(
-                                    "source {} {:?} in workspace {:?}",
-                                    host.kind, host.name, workspace.name
-                                )
-                            })?;
-                        *source = Source::Sqlite(expanded);
-                    }
-                }
-                match source {
-                    Source::Sqlite(source) => {
-                        source.db = expand(&source.db, user_home);
-                        ensure!(
-                            Path::new(&source.db).is_absolute(),
-                            "SQLite database path must be absolute: {}",
-                            source.db
-                        );
-                    }
-                    Source::Markdown(source) => {
-                        source.path = expand(&source.path, user_home);
-                        ensure!(
-                            Path::new(&source.path).is_absolute(),
-                            "Markdown path must be absolute: {}",
-                            source.path
-                        );
-                        source.path = std::fs::canonicalize(&source.path)
-                            .unwrap_or_else(|_| PathBuf::from(&source.path))
-                            .to_string_lossy()
-                            .into_owned();
-                    }
-                    Source::Arena(_) | Source::Host(_) => {}
-                }
+        for v in p.vaults {
+            let declared_path = v.path.clone();
+            match context.vault(v) {
+                Ok(v) => vaults.push(v),
+                Err(error) => problems.push(Problem {
+                    scope: Scope::Vault(resolved_path(&declared_path, &environment.user_home)),
+                    error,
+                }),
             }
-            scopes.push(lower_workspace(workspace.clone())?);
-            all.workspaces.push(workspace);
         }
-        for mut v in scopes {
-            if !v.path.starts_with("workspace:") {
-                v.path = expand(&v.path, user_home);
-                ensure!(
-                    Path::new(&v.path).is_absolute(),
-                    "vault path must be absolute: {}",
-                    v.path
-                );
-                let canonical =
-                    std::fs::canonicalize(&v.path).unwrap_or_else(|_| PathBuf::from(&v.path));
-                v.path = canonical.to_string_lossy().into_owned();
-            }
-            ensure!(paths.insert(v.path.clone()), "duplicate vault {}", v.path);
-            v.profiles = all.profiles.clone();
-            v.learning = v.learning.over(&defaults);
-            v.retrieval = v.retrieval.or_else(|| global_retrieval.clone());
-            let mut entities = std::collections::BTreeSet::new();
-            for r in &mut v.readings {
-                if r.definition.is_some() && r.profile == "inline" {
-                    r.profile = format!("inline:{}", r.entity);
+        for workspace in p.workspaces {
+            let name = workspace.name.clone();
+            if declared[&name] > 1 {
+                if duplicate_reported.insert(name.clone()) {
+                    problems.push(Problem {
+                        scope: Scope::Workspace(name.clone()),
+                        error: anyhow::anyhow!("duplicate workspace {name:?}"),
+                    });
                 }
-                let key = if r.pattern {
-                    format!("matching {}", r.entity.to_lowercase())
-                } else {
-                    r.entity.to_lowercase()
-                };
-                ensure!(entities.insert(key), "duplicate reading {}", r.entity);
-                r.learning = r.learning.over(&v.learning);
-                if r.definition.is_none() {
-                    if let Some(def) = all.profiles.get(&r.profile) {
-                        r.definition = Some(def.clone());
-                    } else if let Some(key) = builtin(&r.profile) {
-                        r.profile = key.into();
-                    } else {
-                        bail!("unknown profile {}", r.profile)
-                    }
-                }
-                // Named workspaces check folder exclusions per Markdown root
-                // while lowering; a path-keyed vault has exactly one root.
-                let (kind, name) = split_entity(&r.entity);
-                ensure!(
-                    kind != "folder"
-                        || v.path.starts_with("workspace:")
-                        || !folder_is_excluded(name, &v.exclusions),
-                    "reading {} is excluded",
-                    r.entity
-                );
+                continue;
             }
-            for policy in &mut v.note_policies {
-                if policy.root.is_none() {
-                    policy.root = Some(v.path.clone());
+            match context.workspace(workspace) {
+                Ok((workspace, vault)) => {
+                    workspaces.push(workspace);
+                    vaults.push(vault);
                 }
+                Err(error) => problems.push(Problem {
+                    scope: Scope::Workspace(name),
+                    error,
+                }),
             }
-            v.targets = v.targets.iter().map(|t| expand(t, user_home)).collect();
-            all.vaults.push(v);
         }
     }
+    // Workspaces are addressed by name, so they may share a folder; a path is
+    // ambiguous only between `vault` declarations.
+    let mut paths = BTreeMap::<String, usize>::new();
+    for v in vaults.iter().filter(|v| v.workspace.is_none()) {
+        *paths.entry(v.path.clone()).or_default() += 1;
+    }
+    for (path, count) in &paths {
+        if *count > 1 {
+            problems.push(Problem {
+                scope: Scope::Vault(path.clone()),
+                error: anyhow::anyhow!("duplicate vault {path}"),
+            });
+        }
+    }
+    vaults.retain(|v| v.workspace.is_some() || paths[&v.path] == 1);
+    all.workspaces = workspaces;
+    all.vaults = vaults;
     all.learning = defaults;
     all.retrieval = global_retrieval;
-    Ok(all)
+    Ok(Namespace {
+        program: all,
+        problems,
+    })
+}
+
+/// Resolve `candidate` together with the rest of its namespace, failing only
+/// on problems the candidate brings: its own, or ones it causes in another
+/// file. Problems the rest of the namespace already had are tolerated, so an
+/// invalid file never blocks editing a different one. Returns the combined
+/// namespace.
+pub fn resolve_with_in(
+    others: Vec<Program>,
+    candidate: Program,
+    environment: &Environment,
+) -> Result<Namespace> {
+    let before = resolve_namespace_in(others.clone(), environment);
+    let mut programs = vec![candidate];
+    programs.extend(others);
+    let after = resolve_namespace_in(programs, environment)?;
+    let known: std::collections::BTreeSet<(Scope, String)> = before
+        .map(|namespace| {
+            namespace
+                .problems
+                .iter()
+                .map(|problem| (problem.scope.clone(), problem.message()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut after = after;
+    if let Some(index) = after
+        .problems
+        .iter()
+        .position(|problem| !known.contains(&(problem.scope.clone(), problem.message())))
+    {
+        return Err(after.problems.swap_remove(index).error);
+    }
+    Ok(after)
+}
+
+/// [`resolve_with_in`] against `user_home` with no Enzyme home or built-in kinds.
+pub fn resolve_with(
+    others: Vec<Program>,
+    candidate: Program,
+    user_home: &Path,
+) -> Result<Namespace> {
+    resolve_with_in(others, candidate, &Environment::new(user_home))
+}
+
+/// A vault path as resolution keys it: `~` expanded, canonical when it exists.
+fn resolved_path(path: &str, user_home: &Path) -> String {
+    let path = expand(path, user_home);
+    std::fs::canonicalize(&path)
+        .unwrap_or_else(|_| PathBuf::from(&path))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// What every workspace and vault of one namespace resolves against.
+struct Resolution<'a> {
+    environment: &'a Environment,
+    all: &'a Program,
+    defaults: &'a Learning,
+    global_retrieval: &'a Option<Vec<String>>,
+    conflicting_profiles: &'a std::collections::BTreeSet<String>,
+    conflicting_kinds: &'a std::collections::BTreeSet<String>,
+}
+
+impl Resolution<'_> {
+    fn workspace(&self, mut workspace: Workspace) -> Result<(Workspace, Vault)> {
+        let user_home = self.environment.user_home.as_path();
+        check_workspace_name(&workspace.name)?;
+        for source in &mut workspace.sources {
+            if let Source::Host(host) = source {
+                ensure!(
+                    !self.conflicting_kinds.contains(&host.kind),
+                    "source {} {:?} uses source kind {}, which config files define differently",
+                    host.kind,
+                    host.name,
+                    host.kind
+                );
+                let kind = self
+                    .all
+                    .source_kinds
+                    .get(&host.kind)
+                    .or_else(|| self.environment.builtin_kinds.get(&host.kind));
+                if let Some(kind) = kind {
+                    let expanded = kind
+                        .expand(host, &workspace.name, self.environment)
+                        .with_context(|| {
+                            format!(
+                                "source {} {:?} in workspace {:?}",
+                                host.kind, host.name, workspace.name
+                            )
+                        })?;
+                    *source = Source::Sqlite(expanded);
+                }
+            }
+            match source {
+                Source::Sqlite(source) => {
+                    source.db = expand(&source.db, user_home);
+                    ensure!(
+                        Path::new(&source.db).is_absolute(),
+                        "SQLite database path must be absolute: {}",
+                        source.db
+                    );
+                }
+                Source::Markdown(source) => {
+                    source.path = expand(&source.path, user_home);
+                    ensure!(
+                        Path::new(&source.path).is_absolute(),
+                        "Markdown path must be absolute: {}",
+                        source.path
+                    );
+                    source.path = std::fs::canonicalize(&source.path)
+                        .unwrap_or_else(|_| PathBuf::from(&source.path))
+                        .to_string_lossy()
+                        .into_owned();
+                }
+                Source::Arena(_) | Source::Host(_) => {}
+            }
+        }
+        let mut vault = lower_workspace(workspace.clone())?;
+        vault.workspace = Some(workspace.name.clone());
+        let vault = self.vault(vault)?;
+        Ok((workspace, vault))
+    }
+
+    fn vault(&self, mut v: Vault) -> Result<Vault> {
+        let user_home = self.environment.user_home.as_path();
+        if !v.path.starts_with("workspace:") {
+            v.path = expand(&v.path, user_home);
+            ensure!(
+                Path::new(&v.path).is_absolute(),
+                "vault path must be absolute: {}",
+                v.path
+            );
+            v.path = resolved_path(&v.path, user_home);
+        }
+        v.profiles = self.all.profiles.clone();
+        v.learning = v.learning.over(self.defaults);
+        v.retrieval = v.retrieval.or_else(|| self.global_retrieval.clone());
+        let mut entities = std::collections::BTreeSet::new();
+        for r in &mut v.readings {
+            if r.definition.is_some() && r.profile == "inline" {
+                r.profile = format!("inline:{}", r.entity);
+            }
+            let key = if r.pattern {
+                format!("matching {}", r.entity.to_lowercase())
+            } else {
+                r.entity.to_lowercase()
+            };
+            ensure!(entities.insert(key), "duplicate reading {}", r.entity);
+            r.learning = r.learning.over(&v.learning);
+            if r.definition.is_none() {
+                ensure!(
+                    !self.conflicting_profiles.contains(&r.profile),
+                    "reading {} uses profile {}, which config files define differently",
+                    r.entity,
+                    r.profile
+                );
+                if let Some(def) = self.all.profiles.get(&r.profile) {
+                    r.definition = Some(def.clone());
+                } else if let Some(key) = builtin(&r.profile) {
+                    r.profile = key.into();
+                } else {
+                    bail!("unknown profile {}", r.profile)
+                }
+            }
+            // Named workspaces check folder exclusions per Markdown root
+            // while lowering; a path-keyed vault has exactly one root.
+            let (kind, name) = split_entity(&r.entity);
+            ensure!(
+                kind != "folder"
+                    || v.path.starts_with("workspace:")
+                    || !folder_is_excluded(name, &v.exclusions),
+                "reading {} is excluded",
+                r.entity
+            );
+        }
+        for policy in &mut v.note_policies {
+            if policy.root.is_none() {
+                policy.root = Some(v.path.clone());
+            }
+        }
+        v.targets = v.targets.iter().map(|t| expand(t, user_home)).collect();
+        Ok(v)
+    }
 }
 fn merge_learning(a: &mut Learning, b: &Learning) -> Result<()> {
     macro_rules! m {
@@ -2351,6 +2653,15 @@ pub fn load_directory(directory: &Path, user_home: &Path) -> Result<Option<Progr
 
 /// [`load_directory`] resolved with [`resolve_in`].
 pub fn load_directory_in(directory: &Path, environment: &Environment) -> Result<Option<Program>> {
+    load_namespace_in(directory, environment)?
+        .map(Namespace::into_program)
+        .transpose()
+}
+
+/// [`load_directory_in`] resolved with [`resolve_namespace_in`]: a file that
+/// does not parse is a [`Scope::File`] problem, and everything else still
+/// resolves.
+pub fn load_namespace_in(directory: &Path, environment: &Environment) -> Result<Option<Namespace>> {
     if !directory.exists() {
         return Ok(None);
     }
@@ -2362,14 +2673,25 @@ pub fn load_directory_in(directory: &Path, environment: &Environment) -> Result<
     if paths.is_empty() {
         return Ok(None);
     }
-    let programs = paths
-        .iter()
-        .map(|p| {
-            parse(&std::fs::read_to_string(p)?)
-                .with_context(|| format!("invalid reading config {}", p.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    resolve_in(programs, environment).map(Some)
+    let mut programs = Vec::new();
+    let mut unparsed = Vec::new();
+    for path in paths {
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| parse(&text))
+            .with_context(|| format!("invalid reading config {}", path.display()));
+        match parsed {
+            Ok(program) => programs.push(program),
+            Err(error) => unparsed.push(Problem {
+                scope: Scope::File(path),
+                error,
+            }),
+        }
+    }
+    let mut namespace = resolve_namespace_in(programs, environment)?;
+    unparsed.append(&mut namespace.problems);
+    namespace.problems = unparsed;
+    Ok(Some(namespace))
 }
 
 pub fn instructions(vault: &Vault) -> String {
@@ -2453,7 +2775,7 @@ pub fn config_value(p: &Program) -> serde_json::Value {
         root.insert("update".into(), json!({"auto":v}));
     }
     let mut vaults = Map::new();
-    for v in &p.vaults {
+    for (key, v) in p.keyed_vaults() {
         // Name patterns have no single entity; they expand at selection time.
         let entities: Vec<Value> = v
             .readings
@@ -2479,7 +2801,7 @@ pub fn config_value(p: &Program) -> serde_json::Value {
         if let Some(n) = v.embedding_limit {
             item["max_embedding_files"] = json!(n);
         }
-        vaults.insert(v.path.clone(), item);
+        vaults.insert(key, item);
     }
     root.insert("vaults".into(), Value::Object(vaults));
     let mut workspaces = Map::new();

@@ -22,7 +22,7 @@
 //! or removing it is out of scope. Writes replace the file by rename: its
 //! permissions are kept, a symlink is written through, but a hard link to the
 //! old file keeps the old contents.
-use crate::{Program, Reading, Source, Workspace, parse, resolve};
+use crate::{Environment, Program, Reading, Source, Workspace, parse, resolve_with_in};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -183,12 +183,23 @@ pub struct PlanRequest<'a> {
     pub namespace: &'a [Program],
 }
 
-/// Checks that a set of programs forms a valid namespace.
+/// Checks a candidate program against its namespace. It receives every other
+/// program in the config directory followed by the candidate, last.
 pub type Validator = dyn Fn(Vec<Program>) -> Result<()> + Send + Sync;
 
-/// The default [`Validator`]: [`resolve`] against `user_home`.
+/// The default [`Validator`]: [`resolve_with`] against `user_home`, so the
+/// candidate must resolve and must not break another file, while problems
+/// other files already have do not block it.
 pub fn resolver(user_home: PathBuf) -> Box<Validator> {
-    Box::new(move |programs| resolve(programs, &user_home).map(drop))
+    resolver_in(Environment::new(user_home))
+}
+
+/// [`resolver`] with a host's [`Environment`] (Enzyme home, built-in kinds).
+pub fn resolver_in(environment: Environment) -> Box<Validator> {
+    Box::new(move |mut programs| {
+        let candidate = programs.pop().context("no candidate program")?;
+        resolve_with_in(programs, candidate, &environment).map(drop)
+    })
 }
 
 /// Plan replacing `request.target` with `request.desired`. Pure apart from
@@ -737,7 +748,7 @@ impl ConfigStore {
         self
     }
 
-    /// Validate namespaces with `validate` instead of plain [`resolve`], for
+    /// Validate namespaces with `validate` instead of [`resolver`], for
     /// hosts that lower their own source kinds first.
     pub fn with_validator(mut self, validate: Box<Validator>) -> Self {
         self.validate = validate;
@@ -787,9 +798,8 @@ impl ConfigStore {
                 many.join(", ")
             ),
         };
-        if let Some((name, error)) = broken.into_iter().find(|(name, _)| *name != target) {
-            return Err(error.context(format!("invalid config file {name}")));
-        }
+        // Another file that does not parse cannot be validated against, but
+        // it must not block editing this workspace.
         Ok((target, others.into_iter().map(|(_, p)| p).collect()))
     }
 

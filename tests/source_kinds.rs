@@ -475,3 +475,19 @@ workspace "practice" {
             .ends_with("feed = 'it''s'")
     );
 }
+
+#[test]
+fn source_names_are_not_paths() {
+    let kind = r#"
+source kind ledger {
+  database "{home}/{source}/x.db"
+  query "SELECT id, t, w FROM rows"
+  id "id" when "t" unit s what "w"
+}
+"#;
+    for name in ["..", "."] {
+        let workspace = format!("workspace \"w\" {{\n  source ledger \"{name}\" {{}}\n}}\n");
+        let message = error(&[kind, &workspace], &environment());
+        assert!(message.contains("must be a name, not a path"), "{message}");
+    }
+}

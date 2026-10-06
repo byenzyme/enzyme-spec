@@ -130,6 +130,13 @@ fn one_invalid_workspace_does_not_stop_the_others() {
         .map(|w| w.name.as_str())
         .collect();
     assert_eq!(names, ["meetings", "people"]);
+    // Declared lone-Markdown folders are known even for workspaces that failed.
+    let declared: Vec<&str> = namespace
+        .lone_markdown_paths
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(declared, ["meetings", "broken", "typo", "people"]);
     assert!(namespace.workspace_problems("meetings").is_empty());
     let broken_problems = namespace.workspace_problems("broken");
     assert_eq!(broken_problems.len(), 1);

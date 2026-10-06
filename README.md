@@ -71,7 +71,9 @@ describes, keeping the declared name:
   `'sqlite:' || {source} || '/' || id AS ref` with `document ref "ref"`.
   (The Enzyme engine requires refs inside `sqlite:<name>/`, with bytes other
   than letters, digits, `-`, `_` and `.` percent-escaped in `<name>`; source
-  names made of those characters need no escaping.)
+  names made of those characters need no escaping.) A source name is a name,
+  not a path: `.`, `..`, `/`, `\` and NUL are rejected. `source` is reserved,
+  so a kind can no longer declare a field named `source`.
 - In `query`, a placeholder stands for a whole SQL value: text becomes a
   single-quoted literal with quotes doubled, integers stay numbers, `true`/`false`
   become `1`/`0`, and a list becomes a parenthesized list of literals, so write
@@ -117,7 +119,10 @@ unusable: its own problems, and unparsable files when it resolved nowhere.
   Markdown folder. Only two `vault "<path>"` declarations of one path
   conflict. `Program::keyed_vaults` gives each resolved vault its runtime key:
   `workspace:<name>`, a `vault`'s path, and the path of a lone-Markdown
-  workspace while nothing else claims it.
+  workspace while nothing else claims it. `Namespace::lone_markdown_paths`
+  lists every lone-Markdown workspace's folder as declared, including ones
+  that failed to resolve, so a host can tell a folder is shared even while one
+  of its workspaces is invalid.
 - A profile or source kind defined differently in two files fails exactly
   the workspaces and vaults that use it.
 - What every declaration inherits is still one namespace: repeated

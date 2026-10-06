@@ -2243,6 +2243,11 @@ impl Problem {
 pub struct Namespace {
     pub program: Program,
     pub problems: Vec<Problem>,
+    /// Every workspace whose only source is one Markdown folder, with that
+    /// folder as resolution keys it (`~` expanded, canonical when it exists),
+    /// whether or not the workspace resolved. A host uses it to tell that a
+    /// folder is shared even while one of its workspaces is invalid.
+    pub lone_markdown_paths: Vec<(String, String)>,
 }
 
 impl Namespace {
@@ -2358,6 +2363,17 @@ pub fn resolve_namespace_in(
     for workspace in programs.iter().flat_map(|p| &p.workspaces) {
         *declared.entry(workspace.name.clone()).or_default() += 1;
     }
+    let lone_markdown_paths = programs
+        .iter()
+        .flat_map(|p| &p.workspaces)
+        .filter_map(|workspace| {
+            let path = workspace.markdown_path()?;
+            Some((
+                workspace.name.clone(),
+                resolved_path(path, &environment.user_home),
+            ))
+        })
+        .collect();
     let mut duplicate_reported = std::collections::BTreeSet::new();
     let mut workspaces = Vec::new();
     let mut vaults: Vec<Vault> = Vec::new();
@@ -2417,6 +2433,7 @@ pub fn resolve_namespace_in(
     Ok(Namespace {
         program: all,
         problems,
+        lone_markdown_paths,
     })
 }
 

@@ -121,6 +121,14 @@ impl SourceKind {
     ) -> Result<SqliteSource> {
         let kind = &self.name;
         let source = &host.name;
+        // `{source}` may fill a database path, so a name must not be one.
+        ensure!(
+            !source.trim().is_empty()
+                && source != "."
+                && source != ".."
+                && !source.contains(['/', '\\', '\0']),
+            "source {kind} {source:?}: a source name must be a name, not a path: no /, \\, NUL, or . / .."
+        );
         let mut database = None;
         for field in &host.fields {
             let key = field.key.as_str();

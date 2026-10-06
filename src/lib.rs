@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub mod plan;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Profile {
     pub seek: String,

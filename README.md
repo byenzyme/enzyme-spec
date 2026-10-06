@@ -63,6 +63,30 @@ Create-note policies (`remember in folder "inbox" create note`) are exposed as
 `Workspace::note_policies`; `Workspace::note_policy_source` names the Markdown
 source a policy writes into, and resolution fills `NotePolicy::root`.
 
+## Plan and apply
+
+`enzyme_spec::plan` changes a program file only through a reviewed plan.
+A plan (`enzyme.plan.v1` JSON) names the workspace and the file that holds it,
+the file's current revision (SHA-256 of its bytes, or `"absent"`), the desired
+text and its digest, a unified diff, a statement-level summary (sources,
+readings, exclusions, settings, profiles), and a `plan_id` over all of them.
+
+```rust
+let store = enzyme_spec::plan::ConfigStore::new(home.join("configs"), &user_home);
+let plan = store.plan("practice", &desired_text)?; // review plan.changes / plan.diff
+let receipt = store.apply(&plan)?;
+```
+
+`apply` writes exactly the desired text, atomically, under a lock, and only
+while the file is still at the planned revision and the plan is exactly what
+planning produces now; otherwise it returns `ApplyError::Stale` or
+`ApplyError::Altered`. The write is journaled first, so an interrupted apply
+is completed by the next caller, and applying an applied plan again returns
+its receipt with `replayed: true`. A new workspace is written to
+`<name>.enzyme`. State lives in `configs/.enzyme-apply/`, which
+`load_directory` ignores. Hosts that lower their own source kinds pass a
+validator with `ConfigStore::with_validator`.
+
 ## License
 
 Apache-2.0. The Enzyme engine that consumes these programs is distributed

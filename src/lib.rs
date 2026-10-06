@@ -2054,9 +2054,15 @@ pub fn resolve(programs: Vec<Program>, user_home: &Path) -> Result<Program> {
     }
     defaults = defaults.over(&Learning::default());
     let mut paths = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
     for p in programs {
         let mut scopes = p.vaults;
         for mut workspace in p.workspaces {
+            ensure!(
+                names.insert(workspace.name.clone()),
+                "duplicate workspace {:?}",
+                workspace.name
+            );
             for source in &mut workspace.sources {
                 match source {
                     Source::Sqlite(source) => {

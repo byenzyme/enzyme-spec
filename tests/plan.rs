@@ -91,7 +91,7 @@ fn plan_summarizes_statement_changes_and_apply_writes_exactly_desired() {
     assert_eq!(receipt.before_revision, plan.base_revision);
     assert_eq!(receipt.after_revision, plan.desired_sha256);
     assert_eq!(read(tmp.path(), "practice.enzyme"), DESIRED);
-    assert!(!store.state().join("journal.json").exists());
+    assert!(!store.state().join("journals/practice.enzyme.json").exists());
     assert!(
         store
             .state()
@@ -267,7 +267,7 @@ fn altered_plans_are_refused() {
         ApplyError::Unsupported(_)
     ));
     assert_eq!(read(tmp.path(), "practice.enzyme"), BASE);
-    assert!(!store.state().join("journal.json").exists());
+    assert!(!store.state().join("journals/practice.enzyme.json").exists());
 }
 
 #[test]
@@ -277,9 +277,6 @@ fn applying_twice_replays_the_receipt() {
     let store = open(tmp.path());
     let plan = store.plan("practice", DESIRED).unwrap();
     let first = store.apply(&plan).unwrap();
-    // A later edit does not make the replay stale: the plan was applied.
-    let later = DESIRED.replace("templates", "drafts");
-    write(tmp.path(), "practice.enzyme", &later);
     let second = store.apply(&plan).unwrap();
     assert!(second.replayed);
     assert_eq!(
@@ -289,6 +286,13 @@ fn applying_twice_replays_the_receipt() {
         },
         first
     );
+    // Once the file has moved on, the old plan is stale, not a replay.
+    let later = DESIRED.replace("templates", "drafts");
+    write(tmp.path(), "practice.enzyme", &later);
+    assert!(matches!(
+        kind(store.apply(&plan).unwrap_err()),
+        ApplyError::Stale { .. }
+    ));
     assert_eq!(read(tmp.path(), "practice.enzyme"), later);
     // The same plan_id with other contents is not a replay.
     let mut forged = plan.clone();
@@ -308,12 +312,12 @@ fn an_interrupted_apply_is_completed_by_the_next_caller() {
     let plan = store.plan("practice", DESIRED).unwrap();
     let journal = store.prepare(&plan).unwrap();
     assert_eq!(read(tmp.path(), "practice.enzyme"), BASE);
-    assert!(store.state().join("journal.json").exists());
+    assert!(store.state().join("journals/practice.enzyme.json").exists());
     // Planning first completes it, so its base is the recovered file.
     let next = store.plan("practice", BASE).unwrap();
     assert_eq!(next.base_revision, plan.desired_sha256);
     assert_eq!(read(tmp.path(), "practice.enzyme"), DESIRED);
-    assert!(!store.state().join("journal.json").exists());
+    assert!(!store.state().join("journals/practice.enzyme.json").exists());
     let replay = store.apply(&plan).unwrap();
     assert!(replay.replayed);
     assert_eq!(
@@ -331,7 +335,7 @@ fn an_interrupted_apply_is_completed_by_the_next_caller() {
     let plan = store.plan("practice", DESIRED).unwrap();
     store.prepare(&plan).unwrap();
     write(tmp.path(), "practice.enzyme", DESIRED);
-    let recovered = store.recover().unwrap().unwrap();
+    let recovered = store.recover().unwrap().remove(0);
     assert_eq!(recovered.plan_id, plan.plan_id);
     assert!(store.apply(&plan).unwrap().replayed);
 
@@ -431,4 +435,116 @@ fn concurrent_applies_from_one_base_serialize() {
         revision(Some(&read(tmp.path(), "practice.enzyme"))),
         applied[0].after_revision
     );
+}
+
+#[test]
+fn a_repeated_plan_is_applied_again_not_replayed() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "practice.enzyme", BASE);
+    let store = open(tmp.path());
+    let forward = store.plan("practice", DESIRED).unwrap();
+    assert!(!store.apply(&forward).unwrap().replayed);
+    let back = store.plan("practice", BASE).unwrap();
+    assert!(!store.apply(&back).unwrap().replayed);
+    assert_eq!(read(tmp.path(), "practice.enzyme"), BASE);
+    // A→B again: the same plan_id as the first apply, but the file is at A.
+    let again = store.plan("practice", DESIRED).unwrap();
+    assert_eq!(again.plan_id, forward.plan_id);
+    let receipt = store.apply(&again).unwrap();
+    assert!(!receipt.replayed);
+    assert_eq!(read(tmp.path(), "practice.enzyme"), DESIRED);
+    assert!(store.apply(&again).unwrap().replayed);
+}
+
+#[test]
+fn an_unrecoverable_journal_blocks_only_its_own_file_until_discarded() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "practice.enzyme", BASE);
+    let store = open(tmp.path());
+    let plan = store.plan("practice", DESIRED).unwrap();
+    store.prepare(&plan).unwrap();
+    let hand = BASE.replace("archive", "hand");
+    write(tmp.path(), "practice.enzyme", &hand);
+    let journal = store.state().join("journals/practice.enzyme.json");
+    let message = format!("{:#}", store.recover().unwrap_err());
+    assert!(
+        message.contains(&journal.display().to_string()),
+        "{message}"
+    );
+    assert!(store.plan("practice", BASE).is_err());
+    // Other workspaces are unaffected.
+    let other = store
+        .plan(
+            "other",
+            "workspace \"other\" {\n  source markdown \"n\" { path \"/srv/o\" }\n}\n",
+        )
+        .unwrap();
+    store.apply(&other).unwrap();
+    let (completed, removed) = store.discard_unrecoverable().unwrap();
+    assert!(completed.is_empty());
+    assert_eq!(removed, [journal.clone()]);
+    assert_eq!(
+        read(tmp.path(), "practice.enzyme"),
+        hand
+    );
+    store.plan("practice", BASE).unwrap();
+}
+
+#[test]
+fn a_new_workspace_declared_elsewhere_since_planning_is_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("configs")).unwrap();
+    let store = open(tmp.path());
+    let plan = store.plan("practice", BASE).unwrap();
+    write(tmp.path(), "elsewhere.enzyme", BASE);
+    assert!(matches!(
+        kind(store.apply(&plan).unwrap_err()),
+        ApplyError::Stale { .. }
+    ));
+}
+
+#[test]
+fn the_lock_stays_in_the_config_directory_and_targets_reject_drive_prefixes() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "practice.enzyme", BASE);
+    let store = open(tmp.path()).with_state_dir(tmp.path().join("elsewhere"));
+    let plan = store.plan("practice", DESIRED).unwrap();
+    store.apply(&plan).unwrap();
+    assert!(tmp.path().join("configs/.enzyme-apply/lock").exists());
+    assert!(!tmp.path().join("elsewhere/lock").exists());
+    assert!(tmp.path().join("elsewhere/receipts").exists());
+    let mut drive = plan.clone();
+    drive.target = "C:practice.enzyme".into();
+    assert!(matches!(
+        kind(store.apply(&drive).unwrap_err()),
+        ApplyError::Altered(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_keeps_the_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "practice.enzyme", BASE);
+    let path = tmp.path().join("configs/practice.enzyme");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let store = open(tmp.path());
+    store
+        .apply(&store.plan("practice", DESIRED).unwrap())
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn leftover_temporaries_are_removed_under_the_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "practice.enzyme", BASE);
+    let leftover = tmp.path().join("configs/.enzyme-apply-1-2.tmp");
+    std::fs::write(&leftover, "partial").unwrap();
+    open(tmp.path()).plan("practice", DESIRED).unwrap();
+    assert!(!leftover.exists());
 }

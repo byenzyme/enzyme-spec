@@ -8,12 +8,20 @@
 //! it chooses the file that holds a workspace, takes a lock, refuses stale or
 //! altered plans, writes atomically, journals the write so an interrupted
 //! apply is completed by the next caller, and keeps one receipt per applied
-//! plan so applying the same plan again replays its receipt.
+//! plan so applying the same plan again, while the file is still at its
+//! result, replays its receipt.
 //!
-//! State lives in `<configs>/.enzyme-apply/` by default: `lock`,
-//! `journal.json` while a write is in flight, and `receipts/<plan_id>.json`.
-//! The directory is ignored by [`crate::load_directory`], which reads only
-//! `*.enzyme` files.
+//! The lock is always `<configs>/.enzyme-apply/lock`, so every host sharing a
+//! config directory serializes on it. Journals (`journals/<target>.json`, one
+//! per file while its write is in flight) and `receipts/<plan_id>.json` live
+//! in the state directory, `<configs>/.enzyme-apply/` unless
+//! [`ConfigStore::with_state_dir`] moves them. The directory is ignored by
+//! [`crate::load_directory`], which reads only `*.enzyme` files.
+//!
+//! A plan replaces one file. Moving a workspace between files, renaming it,
+//! or removing it is out of scope. Writes replace the file by rename: its
+//! permissions are kept, a symlink is written through, but a hard link to the
+//! old file keeps the old contents.
 use crate::{Program, Reading, Source, Workspace, parse, resolve};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -298,7 +306,7 @@ fn check_target(target: &str) -> Result<()> {
     if target.is_empty()
         || target.starts_with('.')
         || !target.ends_with(".enzyme")
-        || target.contains(['/', '\\'])
+        || target.contains(['/', '\\', ':'])
         || target.chars().any(char::is_control)
     {
         bail!("plan target {target:?} must be a plain .enzyme file name");
@@ -722,7 +730,8 @@ impl ConfigStore {
         }
     }
 
-    /// Keep lock, journal, and receipts in `state` instead.
+    /// Keep journals and receipts in `state` instead. The lock stays in
+    /// `configs/.enzyme-apply/lock` so hosts sharing `configs` still serialize.
     pub fn with_state_dir(mut self, state: impl Into<PathBuf>) -> Self {
         self.state = state.into();
         self
@@ -788,7 +797,9 @@ impl ConfigStore {
     /// interrupted apply first so the base revision is current.
     pub fn plan(&self, workspace: &str, desired: &str) -> Result<Plan> {
         let _lock = self.lock()?;
-        self.recover_locked()?;
+        self.recover_locked(None)?;
+        let (target, _) = self.locate(workspace)?;
+        self.recover_locked(Some(&target))?;
         self.plan_locked(workspace, desired)
     }
 
@@ -809,8 +820,9 @@ impl ConfigStore {
 
     /// Apply `plan`: write exactly `plan.desired` to its target, only if the
     /// target is still at `plan.base_revision` and the plan is exactly what
-    /// planning produces now. Applying an already-applied plan returns its
-    /// receipt with `replayed: true` and writes nothing.
+    /// planning produces now. Applying an already-applied plan while its
+    /// target is still at the plan's result returns its receipt with
+    /// `replayed: true` and writes nothing.
     pub fn apply(&self, plan: &Plan) -> Result<Receipt> {
         let journal = self.validate_and_prepare(plan)?;
         let Some((journal, _lock)) = journal else {
@@ -820,11 +832,29 @@ impl ConfigStore {
         Ok(journal.receipt)
     }
 
-    /// Complete an apply that was interrupted after its journal was written.
-    /// Returns the completed receipt, if there was one.
-    pub fn recover(&self) -> Result<Option<Receipt>> {
+    /// Complete every apply that was interrupted after its journal was
+    /// written; returns their receipts. Fails, naming the journal, when a
+    /// target is in neither its before nor its after revision.
+    pub fn recover(&self) -> Result<Vec<Receipt>> {
         let _lock = self.lock()?;
-        self.recover_locked()
+        let completed = self.recover_locked(None)?;
+        self.recover_locked(Some(""))?;
+        Ok(completed)
+    }
+
+    /// Like [`Self::recover`], but remove journals that cannot be recovered
+    /// instead of failing, leaving their targets as they are. Returns the
+    /// completed receipts and the removed journal paths.
+    pub fn discard_unrecoverable(&self) -> Result<(Vec<Receipt>, Vec<PathBuf>)> {
+        let _lock = self.lock()?;
+        let completed = self.recover_locked(None)?;
+        let mut removed = Vec::new();
+        for path in self.journal_paths()? {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            removed.push(path);
+        }
+        sync_dir(&self.journals_dir());
+        Ok((completed, removed))
     }
 
     /// Validate `plan` and journal it without writing the target, as an apply
@@ -851,7 +881,11 @@ impl ConfigStore {
         }
         let request_hash = sha256(&serde_json::to_vec(plan)?);
         let lock = self.lock()?;
-        self.recover_locked()?;
+        self.recover_locked(None)?;
+        let (target, _) = self.locate(&plan.workspace)?;
+        self.recover_locked(Some(&target))?;
+        let current = read_optional(&self.configs.join(&target))?;
+        let actual = revision(current.as_deref());
         if let Some(receipt) = self.load_receipt(&plan.plan_id)? {
             if receipt.request_hash != request_hash {
                 return Err(ApplyError::Altered(
@@ -859,18 +893,25 @@ impl ConfigStore {
                 )
                 .into());
             }
-            return Ok(None);
+            if target == plan.target && actual == receipt.after_revision {
+                return Ok(None);
+            }
         }
-        let (target, _) = self.locate(&plan.workspace)?;
         if target != plan.target {
+            if plan.base_revision == ABSENT {
+                // Planned as new; another file has declared it since.
+                return Err(ApplyError::Stale {
+                    expected: ABSENT.to_string(),
+                    actual,
+                }
+                .into());
+            }
             return Err(ApplyError::Altered(format!(
                 "workspace {:?} lives in {target}, not {}",
                 plan.workspace, plan.target
             ))
             .into());
         }
-        let current = read_optional(&self.configs.join(&target))?;
-        let actual = revision(current.as_deref());
         if actual != plan.base_revision {
             return Err(ApplyError::Stale {
                 expected: plan.base_revision.clone(),
@@ -899,7 +940,10 @@ impl ConfigStore {
             },
             desired: plan.desired.clone(),
         };
-        write_atomic(&self.journal_path(), &serde_json::to_vec_pretty(&journal)?)?;
+        write_atomic(
+            &self.journal_path(&plan.target),
+            &serde_json::to_vec_pretty(&journal)?,
+        )?;
         Ok(Some((journal, lock)))
     }
 
@@ -923,31 +967,52 @@ impl ConfigStore {
 
     fn finish(&self, journal: &Journal) -> Result<()> {
         let path = self.receipt_path(&journal.receipt.plan_id);
-        if !path.exists() {
-            write_atomic(&path, &serde_json::to_vec_pretty(&journal.receipt)?)?;
-        }
-        let journal_path = self.journal_path();
+        write_atomic(&path, &serde_json::to_vec_pretty(&journal.receipt)?)?;
+        let journal_path = self.journal_path(&journal.receipt.target);
         std::fs::remove_file(&journal_path)
             .with_context(|| format!("removing {}", journal_path.display()))?;
-        sync_dir(&self.state);
+        sync_dir(&self.journals_dir());
         Ok(())
     }
 
-    fn recover_locked(&self) -> Result<Option<Receipt>> {
-        let path = self.journal_path();
-        let Some(bytes) = read_optional_bytes(&path)? else {
-            return Ok(None);
-        };
-        let journal: Journal = serde_json::from_slice(&bytes)
-            .with_context(|| format!("invalid apply journal {}", path.display()))?;
-        let receipt = &journal.receipt;
-        check_target(&receipt.target)?;
-        if sha256(journal.desired.as_bytes()) != receipt.after_revision {
-            return Err(ApplyError::Unrecoverable(format!(
-                "journal {} does not match its after revision",
+    /// Complete recoverable journals. With `strict: None`, unrecoverable
+    /// journals are left in place; with `Some(target)` the journal of that
+    /// target (or, for `""`, any journal) that cannot be recovered is an error.
+    fn recover_locked(&self, strict: Option<&str>) -> Result<Vec<Receipt>> {
+        let mut completed = Vec::new();
+        for path in self.journal_paths()? {
+            match self.recover_journal(&path) {
+                Ok(receipt) => completed.push(receipt),
+                Err(error) => {
+                    let unrecoverable = error.downcast_ref::<ApplyError>().is_some();
+                    let target = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    let ours = matches!(strict, Some(t) if t.is_empty() || t == target);
+                    if !unrecoverable || ours {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(completed)
+    }
+
+    fn recover_journal(&self, path: &Path) -> Result<Receipt> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let unrecoverable = |why: String| -> anyhow::Error {
+            ApplyError::Unrecoverable(format!(
+                "{why}; resolve it, then remove {} (enzyme workspace recover --discard)",
                 path.display()
             ))
-            .into());
+            .into()
+        };
+        let journal: Journal = serde_json::from_slice(&bytes)
+            .map_err(|e| unrecoverable(format!("journal does not parse ({e})")))?;
+        let receipt = &journal.receipt;
+        check_target(&receipt.target).map_err(|e| unrecoverable(e.to_string()))?;
+        if sha256(journal.desired.as_bytes()) != receipt.after_revision {
+            return Err(unrecoverable(
+                "journal does not match its after revision".into(),
+            ));
         }
         let current = read_optional(&self.configs.join(&receipt.target))?;
         let actual = revision(current.as_deref());
@@ -956,23 +1021,20 @@ impl ConfigStore {
         } else if actual == receipt.after_revision {
             self.finish(&journal)?;
         } else {
-            return Err(ApplyError::Unrecoverable(format!(
-                "{} is at {actual}, neither {} nor {}; resolve it and remove {}",
-                receipt.target,
-                receipt.before_revision,
-                receipt.after_revision,
-                path.display()
-            ))
-            .into());
+            return Err(unrecoverable(format!(
+                "{} is at {actual}, neither {} nor {}",
+                receipt.target, receipt.before_revision, receipt.after_revision
+            )));
         }
-        Ok(Some(journal.receipt))
+        Ok(journal.receipt)
     }
 
     fn lock(&self) -> Result<std::fs::File> {
         use fs2::FileExt;
-        std::fs::create_dir_all(&self.state)
-            .with_context(|| format!("creating {}", self.state.display()))?;
-        let path = self.state.join("lock");
+        let directory = self.configs.join(STATE_DIR);
+        std::fs::create_dir_all(&directory)
+            .with_context(|| format!("creating {}", directory.display()))?;
+        let path = directory.join("lock");
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -982,11 +1044,39 @@ impl ConfigStore {
             .with_context(|| format!("opening {}", path.display()))?;
         file.lock_exclusive()
             .with_context(|| format!("locking {}", path.display()))?;
+        // Writers hold this lock, so temporaries left now are from a crash.
+        for dir in [
+            self.configs.clone(),
+            self.state.join("receipts"),
+            self.journals_dir(),
+        ] {
+            remove_temporaries(&dir);
+        }
         Ok(file)
     }
 
-    fn journal_path(&self) -> PathBuf {
-        self.state.join("journal.json")
+    fn journals_dir(&self) -> PathBuf {
+        self.state.join("journals")
+    }
+
+    fn journal_path(&self, target: &str) -> PathBuf {
+        self.journals_dir().join(format!("{target}.json"))
+    }
+
+    fn journal_paths(&self) -> Result<Vec<PathBuf>> {
+        let directory = self.journals_dir();
+        let mut paths = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries
+                .map(|e| e.map(|e| e.path()))
+                .collect::<std::io::Result<Vec<_>>>()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", directory.display()));
+            }
+        };
+        paths.retain(|p| p.extension().is_some_and(|e| e == "json"));
+        paths.sort();
+        Ok(paths)
     }
 
     fn receipt_path(&self, plan_id: &str) -> PathBuf {
@@ -1069,6 +1159,9 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
             .create_new(true)
             .open(&temporary)?;
         file.write_all(contents)?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            file.set_permissions(meta.permissions())?;
+        }
         file.sync_all()?;
         std::fs::rename(&temporary, path)?;
         Ok(())
@@ -1079,6 +1172,19 @@ fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     result.with_context(|| format!("writing {}", path.display()))?;
     sync_dir(parent);
     Ok(())
+}
+
+fn remove_temporaries(directory: &Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".enzyme-apply-") && name.ends_with(".tmp") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Best effort: persist a rename. Directories cannot be opened for syncing on

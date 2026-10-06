@@ -81,11 +81,17 @@ let receipt = store.apply(&plan)?;
 while the file is still at the planned revision and the plan is exactly what
 planning produces now; otherwise it returns `ApplyError::Stale` or
 `ApplyError::Altered`. The write is journaled first, so an interrupted apply
-is completed by the next caller, and applying an applied plan again returns
-its receipt with `replayed: true`. A new workspace is written to
-`<name>.enzyme`. State lives in `configs/.enzyme-apply/`, which
-`load_directory` ignores. Hosts that lower their own source kinds pass a
-validator with `ConfigStore::with_validator`.
+is completed by the next caller; a journal whose file was edited by hand in
+between blocks only that file, and `ConfigStore::discard_unrecoverable` drops
+it. Applying an applied plan again, while the file is still at its result,
+returns its receipt with `replayed: true`. A new workspace is written to
+`<name>.enzyme`. The lock is always `configs/.enzyme-apply/lock`; journals and
+receipts live there too unless `with_state_dir` moves them. `load_directory`
+ignores that directory. Writes replace the file by rename, keeping its
+permissions and writing through a symlink; a hard link keeps the old text.
+Moving a workspace between files, renaming, or removing it is out of scope.
+Hosts that lower their own source kinds pass a validator with
+`ConfigStore::with_validator`.
 
 ## License
 

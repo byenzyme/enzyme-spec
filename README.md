@@ -60,11 +60,15 @@ workspace "meetings" {
 
 The engine treats the declared readings as automatic selection's first picks:
 each entity a reading names counts toward the engine's automatic limit (20 in
-Enzyme), and its documents count as already covered, so automatic picks favor
-what the readings miss. `up to N` caps the automatic picks further; it never
-raises the limit. A reading always takes precedence for its entity (the entity
-is learned once, with the reading's settings), leave-outs apply to automatic
-picks, and hosts never write automatic picks back into the program. The
+Enzyme; `settings { selection limit N }` changes it), and the documents of
+everything the readings select count as already covered, so automatic picks
+favor what the readings miss. `up to N` caps the automatic picks further; it
+never raises the limit. A reading always takes precedence for its entity (the
+entity is learned once, with the reading's settings), and a reading's own cap
+holds: automatic selection never adds a match of a declared `matching` pattern,
+a linked page of a declared folder, or a who link of a source read `including
+who links`. Leave-outs apply to automatic picks, and hosts never write
+automatic picks back into the program. The
 statement renders after the readings, and without readings it simply allows
 `up to N` to cap ordinary automatic selection. `learn questions automatically
 select …` is an error: automatic selection ranks by coverage, not by frequency

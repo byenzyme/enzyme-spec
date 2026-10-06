@@ -232,6 +232,9 @@ fn a_file_that_does_not_parse_fails_only_what_it_could_declare() {
         "{}",
         problems[0].message()
     );
+    // A path no resolved declaration claims may be declared in the broken file.
+    assert_eq!(namespace.vault_problems("/srv/unclaimed").len(), 1);
+    assert!(namespace.vault_problems("/srv/shared-notes").is_empty());
     // The strict loader is unchanged.
     assert!(enzyme_spec::load_directory_in(dir.path(), &environment()).is_err());
 }

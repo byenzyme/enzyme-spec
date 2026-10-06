@@ -2269,13 +2269,18 @@ impl Namespace {
             .collect()
     }
 
-    /// Problems that make the vault at resolved path `path` unusable. A
-    /// folder addressed by path needs no declaration, so unparsable files do
-    /// not count here.
+    /// Problems that make the vault at resolved path `path` unusable: its
+    /// own, and — when no resolved vault or lone-Markdown workspace claims the
+    /// path — every config file that does not parse, since it may declare it.
     pub fn vault_problems(&self, path: &str) -> Vec<&Problem> {
+        let claimed = self.program.vaults.iter().any(|v| v.path == path);
         self.problems
             .iter()
-            .filter(|problem| matches!(&problem.scope, Scope::Vault(scope) if scope == path))
+            .filter(|problem| match &problem.scope {
+                Scope::Vault(scope) => scope == path,
+                Scope::File(_) => !claimed,
+                _ => false,
+            })
             .collect()
     }
 }

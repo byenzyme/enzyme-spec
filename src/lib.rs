@@ -2269,21 +2269,13 @@ impl Namespace {
             .collect()
     }
 
-    /// Problems that make the vault at resolved path `path` unusable, by the
-    /// same rule as [`Self::workspace_problems`].
+    /// Problems that make the vault at resolved path `path` unusable. A
+    /// folder addressed by path needs no declaration, so unparsable files do
+    /// not count here.
     pub fn vault_problems(&self, path: &str) -> Vec<&Problem> {
-        let resolved = self
-            .program
-            .vaults
-            .iter()
-            .any(|v| v.workspace.is_none() && v.path == path);
         self.problems
             .iter()
-            .filter(|problem| match &problem.scope {
-                Scope::Vault(scope) => scope == path,
-                Scope::File(_) => !resolved,
-                _ => false,
-            })
+            .filter(|problem| matches!(&problem.scope, Scope::Vault(scope) if scope == path))
             .collect()
     }
 }
